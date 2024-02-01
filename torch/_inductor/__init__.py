@@ -1,8 +1,9 @@
 from typing import Any, Dict, List, Optional
 
 import torch.fx
+import torch.utils._pytree as pytree
 
-__all__ = ["compile", "list_mode_options", "list_options"]
+__all__ = ["compile", "list_mode_options", "list_options", "cudagraph_mark_step_begin"]
 
 
 def compile(
@@ -43,38 +44,78 @@ def aot_compile(
     Returns:
         Path to the generated shared library
     """
-    from .compile_fx import compile_fx
+    from .compile_fx import compile_fx_aot
 
-    return compile_fx(gm, example_inputs, config_patches=options, aot_mode=True)()
+    # We will serialize the pytree info into the .so as constant strings
+    serialized_in_spec = ""
+    serialized_out_spec = ""
+    if isinstance(gm.graph._codegen, torch.fx.graph._PyTreeCodeGen):
+        codegen = gm.graph._codegen
+        gm.graph._codegen = torch.fx.graph.CodeGen()
+        gm.recompile()
+
+        if codegen.pytree_info.in_spec is not None:
+            serialized_in_spec = pytree.treespec_dumps(codegen.pytree_info.in_spec)
+
+        if codegen.pytree_info.out_spec is not None:
+            serialized_out_spec = pytree.treespec_dumps(codegen.pytree_info.out_spec)
+
+    options = (
+        {
+            "aot_inductor.serialized_in_spec": serialized_in_spec,
+            "aot_inductor.serialized_out_spec": serialized_out_spec,
+        }
+        if options is None
+        else {
+            **options,
+            "aot_inductor.serialized_in_spec": serialized_in_spec,
+            "aot_inductor.serialized_out_spec": serialized_out_spec,
+        }
+    )
+
+    return compile_fx_aot(
+        gm,
+        example_inputs,
+        config_patches=options,
+    )
 
 
-def list_mode_options(mode: str = None) -> Dict[str, Any]:
+def list_mode_options(
+    mode: Optional[str] = None, dynamic: Optional[bool] = None
+) -> Dict[str, Any]:
     r"""Returns a dictionary describing the optimizations that each of the available
     modes passed to `torch.compile()` performs.
 
     Args:
         mode (str, optional): The mode to return the optimizations for.
         If None, returns optimizations for all modes
+        dynamic (bool, optional): Whether dynamic shape is enabled.
 
     Example::
         >>> torch._inductor.list_mode_options()
     """
 
-    mode_options = {
+    mode_options: Dict[str, Dict[str, bool]] = {
         "default": {},
+        # enable cudagraphs
         "reduce-overhead": {
             "triton.cudagraphs": True,
         },
+        # enable max-autotune
+        "max-autotune-no-cudagraphs": {
+            "max_autotune": True,
+        },
+        # enable max-autotune
+        # enable cudagraphs
         "max-autotune": {
-            "epilogue_fusion": True,
             "max_autotune": True,
             "triton.cudagraphs": True,
         },
     }
-    return mode_options[mode] if mode else mode_options
+    return mode_options[mode] if mode else mode_options  # type: ignore[return-value]
 
 
-def list_options() -> Dict[str, Any]:
+def list_options() -> List[str]:
     r"""Returns a dictionary describing the optimizations and debug configurations
     that are available to `torch.compile()`.
 
@@ -87,6 +128,13 @@ def list_options() -> Dict[str, Any]:
 
     from torch._inductor import config
 
-    current_config: Dict[str, Any] = config.to_dict()  # type: ignore[attr-defined]
+    current_config: Dict[str, Any] = config.shallow_copy_dict()
 
     return list(current_config.keys())
+
+
+def cudagraph_mark_step_begin():
+    "Indicates that a new iteration of inference or training is about to begin."
+    from .cudagraph_trees import mark_step_begin
+
+    mark_step_begin()

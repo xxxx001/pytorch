@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+
 import faulthandler
 import logging
 import multiprocessing
@@ -41,6 +43,7 @@ from torch.testing._internal.distributed.multi_threaded_pg import (
     _uninstall_threaded_pg,
     ProcessLocalGroup,
 )
+import operator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -152,7 +155,7 @@ def import_transformers_or_skip():
         @wraps(func)
         def wrapper(*args, **kwargs):
             try:
-                from transformers import (  # noqa: Unused
+                from transformers import (  # noqa: F401
                     AutoModelForMaskedLM,
                     BertConfig,
                 )
@@ -215,33 +218,33 @@ def verify_ddp_error_logged(model_DDP, err_substr):
 
 def with_nccl_blocking_wait(func):
     """
-    Convenience decorator to set/unset NCCL_BLOCKING_WAIT flag. Note that use of
-    this decorator will override the setting of NCCL_ASYNC_ERROR_HANDLING for
-    the particular test. After the test, both NCCL_BLOCKING_WAIT and
-    NCCL_ASYNC_ERROR_HANDLING will be restored to their original values.
+    Convenience decorator to set/unset TORCH_NCCL_BLOCKING_WAIT flag. Note that use of
+    this decorator will override the setting of TORCH_NCCL_ASYNC_ERROR_HANDLING for
+    the particular test. After the test, both TORCH_NCCL_BLOCKING_WAIT and
+    TORCH_NCCL_ASYNC_ERROR_HANDLING will be restored to their original values.
     """
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        # Save and unset NCCL_ASYNC_ERROR_HANDLING
+        # Save and unset TORCH_NCCL_ASYNC_ERROR_HANDLING
         try:
             cached_nccl_async_error_handling: Union[str, None] = os.environ[
-                "NCCL_ASYNC_ERROR_HANDLING"
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING"
             ]
-            del os.environ["NCCL_ASYNC_ERROR_HANDLING"]
+            del os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"]
         except KeyError:
-            # NCCL_ASYNC_ERROR_HANDLING was unset
+            # TORCH_NCCL_ASYNC_ERROR_HANDLING was unset
             cached_nccl_async_error_handling = None
 
-        # Save val of NCCL_BLOCKING_WAIT and set it.
+        # Save val of TORCH_NCCL_BLOCKING_WAIT and set it.
         try:
             cached_nccl_blocking_wait: Union[str, None] = os.environ[
-                "NCCL_BLOCKING_WAIT"
+                "TORCH_NCCL_BLOCKING_WAIT"
             ]
         except KeyError:
             cached_nccl_blocking_wait = None
         finally:
-            os.environ["NCCL_BLOCKING_WAIT"] = "1"
+            os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
 
         try:
             ret = func(*args, **kwargs)
@@ -250,11 +253,11 @@ def with_nccl_blocking_wait(func):
             # restore old values.
             if cached_nccl_async_error_handling is not None:
                 os.environ[
-                    "NCCL_ASYNC_ERROR_HANDLING"
+                    "TORCH_NCCL_ASYNC_ERROR_HANDLING"
                 ] = cached_nccl_async_error_handling
 
             if cached_nccl_blocking_wait is not None:
-                os.environ["NCCL_BLOCKING_WAIT"] = cached_nccl_blocking_wait
+                os.environ["TORCH_NCCL_BLOCKING_WAIT"] = cached_nccl_blocking_wait
 
     return wrapper
 
@@ -353,6 +356,7 @@ def create_tcp_store(
     timeout=timedelta(minutes=5),
     wait_for_workers=True,
     jit_class=False,
+    use_libuv=False
 ):
     """
     Creates a TCP store. Retries if the chosen port is already in use.
@@ -365,7 +369,7 @@ def create_tcp_store(
         )
     else:
         return c10d.TCPStore(
-            addr, port, world_size, is_master, wait_for_workers=wait_for_workers
+            addr, port, world_size, is_master, wait_for_workers=wait_for_workers, use_libuv=use_libuv
         )
 
 
@@ -425,7 +429,7 @@ def simple_sparse_reduce_tests(rank: int, world_size: int, num_inputs: int = 1):
 
     def compute_sum(fn, world_size: int):
         return reduce(
-            lambda a, b: a + b, [fn(rank, world_size) for rank in range(world_size)]
+            operator.add, [fn(rank, world_size) for rank in range(world_size)]
         )
 
     return [
@@ -456,15 +460,6 @@ def init_multigpu_helper(world_size: int, backend: str):
     """
     nGPUs = torch.cuda.device_count()
     visible_devices = range(nGPUs)
-
-    if backend == "nccl":
-        # This is a hack for a known NCCL issue using multiprocess
-        # in conjunction with multiple threads to manage different GPUs which
-        # may cause ncclCommInitRank to fail.
-        # http://docs.nvidia.com/deeplearning/sdk/nccl-release-notes/rel_2.1.4.html#rel_2.1.4
-        # It slows down the performance of collective operations.
-        # Without this setting NCCL might throw unhandled error.
-        os.environ["NCCL_MAX_NRINGS"] = "1"
 
     # If rank is less than or equal to number of available GPU's
     # then each rank can be mapped to corresponding GPU.
@@ -586,7 +581,7 @@ class MultiProcessTestCase(TestCase):
                 args=(rank, self._current_test_name(), self.file_name, child_conn),
             )
             process.start()
-            logger.info(f"Started process {rank} with pid {process.pid}")
+            logger.info("Started process %s with pid %s", rank, process.pid)
             self.pid_to_pipe[process.pid] = parent_conn
             self.processes.append(process)
 
@@ -599,7 +594,7 @@ class MultiProcessTestCase(TestCase):
 
     @staticmethod
     def _event_listener(parent_pipe, signal_pipe, rank: int):
-        logger.info(f"Starting event listener thread for rank {rank}")
+        logger.info("Starting event listener thread for rank %s", rank)
         while True:
             ready_pipes = multiprocessing.connection.wait([parent_pipe, signal_pipe])
 
@@ -607,12 +602,12 @@ class MultiProcessTestCase(TestCase):
 
                 if parent_pipe.closed:
                     logger.info(
-                        f"Pipe closed for process {rank}, stopping event listener thread"
+                        "Pipe closed for process %s, stopping event listener thread", rank
                     )
                     return
 
                 event = parent_pipe.recv()
-                logger.info(f"Received event {event} on process {rank}")
+                logger.info("Received event %s on process %s", event, rank)
 
                 if event == MultiProcessTestCase.Event.GET_TRACEBACK:
                     # Return traceback to the parent process.
@@ -623,7 +618,7 @@ class MultiProcessTestCase(TestCase):
                         tmp_file.seek(0)
                         parent_pipe.send(tmp_file.read())
 
-                        logger.info(f"Process {rank} sent traceback")
+                        logger.info("Process %s sent traceback", rank)
 
             if signal_pipe in ready_pipes:
                 return
@@ -657,13 +652,14 @@ class MultiProcessTestCase(TestCase):
             getattr(self, test_name)()
         except unittest.SkipTest as se:
             logger.info(
-                f"Process {self.rank} skipping test {test_name} for following reason: {str(se)}"
+                "Process %s skipping test %s for following reason: %s", self.rank, test_name, str(se)
             )
             sys.exit(TEST_SKIPS["generic"].exit_code)
         except Exception as e:
             logger.error(
-                f"Caught exception: \n{traceback.format_exc()} exiting "
-                f"process {self.rank} with exit code: {MultiProcessTestCase.TEST_ERROR_EXIT_CODE}"
+                "Caught exception: \n%s exiting "
+                "process %s with exit code: %s",
+                traceback.format_exc(), self.rank, MultiProcessTestCase.TEST_ERROR_EXIT_CODE
             )
             # Send error to parent process.
             parent_pipe.send(traceback.format_exc())
@@ -687,7 +683,7 @@ class MultiProcessTestCase(TestCase):
                     pipes.append((i, pipe))
                 except ConnectionError as e:
                     logger.error(
-                        f"Encountered error while trying to get traceback for process {i}: {e}"
+                        "Encountered error while trying to get traceback for process %s: %s", i, e
                     )
 
         # Wait for results.
@@ -697,21 +693,21 @@ class MultiProcessTestCase(TestCase):
                 if pipe.poll(5):
                     if pipe.closed:
                         logger.info(
-                            f"Pipe closed for process {rank}, cannot retrieve traceback"
+                            "Pipe closed for process %s, cannot retrieve traceback", rank
                         )
                         continue
 
                     traceback = pipe.recv()
                     logger.error(
-                        f"Process {rank} timed out with traceback: \n\n{traceback}"
+                        "Process %s timed out with traceback: \n\n%s", rank, traceback
                     )
                 else:
                     logger.error(
-                        f"Could not retrieve traceback for timed out process: {rank}"
+                        "Could not retrieve traceback for timed out process: %s", rank
                     )
             except ConnectionError as e:
                 logger.error(
-                    f"Encountered error while trying to get traceback for process {rank}: {e}"
+                    "Encountered error while trying to get traceback for process %s: %s", rank, e
                 )
 
     def _join_processes(self, fn) -> None:
@@ -736,7 +732,7 @@ class MultiProcessTestCase(TestCase):
                 if subprocess_error:
                     break
                 # All processes have joined cleanly if they all a valid exitcode
-                if all([p.exitcode is not None for p in self.processes]):
+                if all(p.exitcode is not None for p in self.processes):
                     break
                 # Check if we should time out the test. If so, we terminate each process.
                 elapsed = time.time() - start_time
@@ -759,7 +755,7 @@ class MultiProcessTestCase(TestCase):
                 self._check_return_codes(elapsed_time)
         finally:
             # Close all pipes
-            for pid, pipe in self.pid_to_pipe.items():
+            for pipe in self.pid_to_pipe.values():
                 pipe.close()
 
     def _check_no_test_errors(self, elapsed_time) -> None:
@@ -769,7 +765,7 @@ class MultiProcessTestCase(TestCase):
         for i, p in enumerate(self.processes):
             if p.exitcode is None:
                 raise RuntimeError(
-                    "Process {} timed out after {} seconds".format(i, elapsed_time)
+                    f"Process {i} timed out after {elapsed_time} seconds"
                 )
             self.assertNotEqual(self.TEST_ERROR_EXIT_CODE, p.exitcode)
 
@@ -778,6 +774,11 @@ class MultiProcessTestCase(TestCase):
         Checks that the return codes of all spawned processes match, and skips
         tests if they returned a return code indicating a skipping condition.
         """
+        # If no processes are spawned, there is nothing to check.
+        if not self.processes:
+            logger.warning("Note: no subprocesses were spawned, test was likely skipped.")
+            return
+
         first_process = self.processes[0]
         # first, we check if there are errors in actual processes
         # (via TEST_ERROR_EXIT CODE), and raise an exception for those.
@@ -807,9 +808,7 @@ class MultiProcessTestCase(TestCase):
         for i, p in enumerate(self.processes):
             if p.exitcode is None:
                 raise RuntimeError(
-                    "Process {} terminated or timed out after {} seconds".format(
-                        i, elapsed_time
-                    )
+                    f"Process {i} terminated or timed out after {elapsed_time} seconds"
                 )
             self.assertEqual(
                 p.exitcode,
@@ -826,7 +825,7 @@ class MultiProcessTestCase(TestCase):
                     # is some follow-up needed. Instead just "pass" the test
                     # with an appropriate message.
                     logger.info(
-                        f"Skipping {self.id()} on sandcastle for the following reason: {skip.message}"
+                        "Skipping %s on sandcastle for the following reason: %s", self.id(), skip.message
                     )
                     return
                 else:
@@ -834,9 +833,7 @@ class MultiProcessTestCase(TestCase):
         self.assertEqual(
             first_process.exitcode,
             0,
-            msg="Expected zero exit code but got {} for pid: {}".format(
-                first_process.exitcode, first_process.pid
-            ),
+            msg=f"Expected zero exit code but got {first_process.exitcode} for pid: {first_process.pid}",
         )
 
     @property
@@ -860,7 +857,7 @@ def has_efa() -> bool:
 
     try:
         EFA_PROBE_RESULT = (
-            subprocess.run(["fi_info", "-p", "efa", "-t", "FI_EP_RDM"]).returncode == 0
+            subprocess.run(["fi_info", "-p", "efa", "-t", "FI_EP_RDM"], check=False).returncode == 0
         )
     except FileNotFoundError:
         EFA_PROBE_RESULT = False
@@ -1028,7 +1025,6 @@ class MultiThreadedTestCase(TestCase):
         """
         Run the current test associated with `test_name` using the threaded process group.
         """
-
         c10d.init_process_group(
             backend="threaded", rank=rank, world_size=world_size, store=self.__class__.global_store
         )
@@ -1086,23 +1082,21 @@ class MultiThreadedTestCase(TestCase):
             exc = exc_info[1]
             if isinstance(exc, unittest.SkipTest):
                 logger.info(
-                    f"Thread {rank} skipping test {fn} for following reason: {str(exc)}"
+                    "Thread %s skipping test %s for following reason: %s", rank, fn, str(exc)
                 )
                 if skip_code < 0:
                     skip_code = TEST_SKIPS["generic"].exit_code
             elif isinstance(exc, TimeoutError):
-                msg = "Thread {} terminated or timed out after {} seconds\n".format(
-                    rank, timeout
-                )
+                msg = f"Thread {rank} terminated or timed out after {timeout} seconds\n"
                 logger.error(msg)
                 raise RuntimeError(msg)
             elif isinstance(exc, Exception):
                 msg = "".join(traceback.format_exception(*exc_info))
                 logger.error(
-                    f"Caught exception: \n{msg} exiting thread {rank}"
+                    "Caught exception: \n%s exiting thread %s", msg, rank
                 )
                 error_msg += (
-                    "Thread {} exited with exception:\n{}\n".format(rank, msg)
+                    f"Thread {rank} exited with exception:\n{msg}\n"
                 )
             elif isinstance(exc, SystemExit):
                 if type(exc.code) == int and skip_code < 0:
@@ -1118,7 +1112,7 @@ class MultiThreadedTestCase(TestCase):
                     if IS_SANDCASTLE:
                         # "pass" the test with an appropriate message.
                         logger.info(
-                            f"Skipping {fn} on sandcastle for the following reason: {skip.message}"
+                            "Skipping %s on sandcastle for the following reason: %s", fn, skip.message
                         )
                         return
                     else:

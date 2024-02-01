@@ -3,6 +3,7 @@
 import torch
 import torch.utils.bundled_inputs
 import io
+from tempfile import TemporaryFileName
 from typing import Dict, List
 import inspect
 from torch.testing import FileCheck
@@ -81,7 +82,7 @@ class TestLiteScriptModule(TestCase):
             buffer = io.BytesIO(exported_module)
             buffer.seek(0)
 
-            assert(b"callstack_debug_map.pkl" in exported_module)
+            assert b"callstack_debug_map.pkl" in exported_module
 
             mobile_module = _load_for_lite_interpreter(buffer)
             with self.assertRaisesRegex(RuntimeError, r"Module hierarchy:top\(B\)::<unknown>.A0\(A\)::forward.aten::mul"):
@@ -197,7 +198,7 @@ class TestLiteScriptModule(TestCase):
         )
 
     def test_unsupported_classtype(self):
-        class Foo():
+        class Foo:
             def __init__(self):
                 return
 
@@ -313,7 +314,7 @@ class TestLiteScriptModule(TestCase):
         loaded = self.getScriptExportImportCopy(ft)
         _, lineno = inspect.getsourcelines(FooTest)
 
-        with self.assertRaisesRegex(RuntimeError, 'test_lite_script_module.py\", line {}'.format(lineno + 3)):
+        with self.assertRaisesRegex(RuntimeError, f'test_lite_script_module.py\", line {lineno + 3}'):
             loaded(torch.rand(3, 4), torch.rand(30, 40))
 
     def test_source_range_raise_exception(self):
@@ -357,8 +358,8 @@ class TestLiteScriptModule(TestCase):
             loaded(torch.rand(3, 4), torch.rand(3, 4), torch.rand(30, 40))
         except RuntimeError as e:
             error_message = f"{e}"
-        self.assertTrue('test_lite_script_module.py\", line {}'.format(lineno + 3) in error_message)
-        self.assertTrue('test_lite_script_module.py\", line {}'.format(lineno + 9) in error_message)
+        self.assertTrue(f'test_lite_script_module.py\", line {lineno + 3}' in error_message)
+        self.assertTrue(f'test_lite_script_module.py\", line {lineno + 9}' in error_message)
         self.assertTrue('top(FooTest3)' in error_message)
 
     def test_source_range_no_debug_info(self):

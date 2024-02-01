@@ -5,7 +5,6 @@
 #include <c10/macros/Macros.h>
 #include <c10/util/ArrayRef.h>
 #include <c10/util/FbcodeMaps.h>
-#include <c10/util/variant.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/ir/graph_node_list.h>
 #include <torch/csrc/jit/ir/ir.h>
@@ -21,8 +20,7 @@
 #include <folly/container/F14Set.h>
 #endif
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 TORCH_API bool canEnableStaticRuntime(
     const std::shared_ptr<torch::jit::Graph>& graph);
@@ -248,6 +246,19 @@ class StaticRuntime;
 
 using SROperator = std::function<void(ProcessedNode*)>;
 
+#ifdef FBCODE_CAFFE2
+struct TORCH_API SROperatorObserver {
+  using OperatorCallback = void (*)(const Node*);
+  OperatorCallback startCb = nullptr;
+  OperatorCallback endCb = nullptr;
+
+  static void setCurrentThreadObserver(SROperatorObserver* observer);
+  static SROperatorObserver* getCurrentThreadObserver();
+  static void onStart(const Node* name);
+  static void onEnd(const Node* name);
+};
+#endif
+
 // A `BlockInfo` instance stores all of the shared state that each
 // `BlockRunner` will need to access. Most of this information is
 // read-only and shared between threads.
@@ -260,8 +271,7 @@ using SROperator = std::function<void(ProcessedNode*)>;
 //   planner.
 class BlockInfo {
  public:
-  BlockInfo(uint32_t input_idx, Block& block)
-      : input_idx_(input_idx), block_(block) {}
+  BlockInfo(uint32_t input_idx, Block& block);
 
   void set_nodes(
       std::vector<StaticNodeInfo> nodes,
@@ -271,9 +281,7 @@ class BlockInfo {
     return nodes_;
   }
 
-  size_t num_nodes() const {
-    return nodes_.size();
-  }
+  size_t num_nodes() const;
 
   size_t num_inputs() const {
     return block_.inputs().size();
@@ -838,6 +846,10 @@ class TORCH_API StaticNodeInfo {
   uint16_t outputs_offset_;
 };
 
+inline size_t BlockInfo::num_nodes() const {
+  return nodes_.size();
+}
+
 /*
   ProcessedNodeMetadata class wraps the possible metadata
   for ProcessedNode. Depending upon the nature of op, processedNode
@@ -898,7 +910,7 @@ class TORCH_API ProcessedNode {
 
   // These should be noexcept, but some Android build is failing
   // saying the noexcept specification doesn't match the calculated
-  // one. Maybe c10::variant is throwing it off?
+  // one. Maybe std::variant is throwing it off?
   ProcessedNode(ProcessedNode&&) = default;
 
   ProcessedNode(const ProcessedNode&) = delete;
@@ -1131,5 +1143,4 @@ class TORCH_API StaticRuntime {
   IValueArray values_;
 };
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

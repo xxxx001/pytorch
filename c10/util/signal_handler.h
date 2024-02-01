@@ -2,10 +2,10 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdint>
 #include <mutex>
 
 #include <c10/macros/Export.h>
-#include <c10/util/Logging.h>
 
 #if defined(__APPLE__)
 #define C10_SUPPORTS_SIGNAL_HANDLER
@@ -35,8 +35,8 @@ class C10_API SignalHandler {
 
   Action SIGINT_action_;
   Action SIGHUP_action_;
-  unsigned long my_sigint_count_;
-  unsigned long my_sighup_count_;
+  std::atomic<uint64_t> my_sigint_count_;
+  std::atomic<uint64_t> my_sighup_count_;
 };
 
 #if defined(C10_SUPPORTS_FATAL_SIGNAL_HANDLERS)
@@ -98,6 +98,7 @@ class C10_API FatalSignalHandler {
     struct sigaction previous;
   };
 
+  // NOLINTNEXTLINE(*c-arrays*)
   static signal_handler kSignalHandlers[];
 };
 

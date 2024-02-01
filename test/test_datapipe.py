@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+
 # Owner(s): ["module: dataloader"]
 
 import copy
@@ -5,6 +7,7 @@ import itertools
 import os
 import os.path
 import pickle
+import pydoc
 import random
 import sys
 import tempfile
@@ -17,14 +20,20 @@ from typing import (
     Generic,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Set,
     Tuple,
     Type,
     TypeVar,
     Union,
+    TYPE_CHECKING
 )
+if not TYPE_CHECKING:
+    # pyre isn't treating this the same as a typing.NamedTuple
+    from typing_extensions import NamedTuple
+else:
+    from typing import NamedTuple
+
 from unittest import skipIf
 
 import numpy as np
@@ -34,7 +43,10 @@ import torch.nn as nn
 import torch.utils.data.datapipes as dp
 import torch.utils.data.graph
 import torch.utils.data.graph_settings
-from torch.testing._internal.common_utils import TestCase, run_tests, suppress_warnings, skipIfTorchDynamo
+from torch.testing._internal.common_utils import (
+    TestCase, run_tests, suppress_warnings, skipIfTorchDynamo, TEST_DILL, skipIfNoDill,
+)
+from torch.utils._import_utils import import_dill
 from torch.utils.data import (
     DataLoader,
     DataChunk,
@@ -56,19 +68,10 @@ from torch.utils.data.datapipes.utils.snapshot import (
 from torch.utils.data.datapipes.dataframe import CaptureDataFrame
 from torch.utils.data.datapipes.dataframe import dataframe_wrapper as df_wrapper
 from torch.utils.data.datapipes.iter.sharding import SHARDING_PRIORITIES
+import operator
 
-try:
-    import dill
-
-    # XXX: By default, dill writes the Pickler dispatch table to inject its
-    # own logic there. This globally affects the behavior of the standard library
-    # pickler for any user who transitively depends on this module!
-    # Undo this extension to avoid altering the behavior of the pickler globally.
-    dill.extend(use_dill=False)
-    HAS_DILL = True
-except ImportError:
-    HAS_DILL = False
-skipIfNoDill = skipIf(not HAS_DILL, "no dill")
+dill = import_dill()
+HAS_DILL = TEST_DILL
 
 try:
     import pandas  # type: ignore[import] # noqa: F401 F403
@@ -199,7 +202,7 @@ class TestStreamWrapper(TestCase):
             if self.opened:
                 return "".join(self)
             else:
-                raise IOError("Cannot read from un-opened file descriptor")
+                raise OSError("Cannot read from un-opened file descriptor")
 
         def __iter__(self):
             for i in range(5):
@@ -221,7 +224,7 @@ class TestStreamWrapper(TestCase):
         for api in ['open', 'read', 'close']:
             self.assertTrue(api in s)
 
-    @skipIfTorchDynamo
+    @skipIfTorchDynamo()
     def test_api(self):
         fd = TestStreamWrapper._FakeFD("")
         wrap_fd = StreamWrapper(fd)
@@ -278,7 +281,7 @@ class TestIterableDataPipeBasic(TestCase):
             self.temp_sub_dir.cleanup()
             self.temp_dir.cleanup()
         except Exception as e:
-            warnings.warn("TestIterableDatasetBasic was not able to cleanup temp dir due to {}".format(str(e)))
+            warnings.warn(f"TestIterableDatasetBasic was not able to cleanup temp dir due to {str(e)}")
 
     def test_listdirfiles_iterable_datapipe(self):
         temp_dir = self.temp_dir.name
@@ -775,6 +778,7 @@ class TestFunctionalIterDataPipe(TestCase):
                 datapipe = dpipe(custom_input, *dp_args, **dp_kwargs)  # type: ignore[call-arg]
                 self._serialization_test_for_single_dp(datapipe)
 
+    @skipIfTorchDynamo("Dict with function as keys")
     def test_serializable_with_dill(self):
         """Only for DataPipes that take in a function as argument"""
         input_dp = dp.iter.IterableWrapper(range(10))
@@ -830,6 +834,43 @@ class TestFunctionalIterDataPipe(TestCase):
                         datapipe = dpipe(input_dp, *dp_args, **dp_kwargs)  # type: ignore[call-arg]
                     with self.assertRaises((pickle.PicklingError, AttributeError)):
                         pickle.dumps(datapipe)
+
+    def test_docstring(self):
+        """
+        Ensure functional form of IterDataPipe has the correct docstring from
+        the class form.
+
+        Regression test for https://github.com/pytorch/data/issues/792.
+        """
+        input_dp = dp.iter.IterableWrapper(range(10))
+
+        for dp_funcname in [
+            "batch",
+            "collate",
+            "concat",
+            "demux",
+            "filter",
+            "fork",
+            "map",
+            "mux",
+            "read_from_stream",
+            # "sampler",
+            "shuffle",
+            "unbatch",
+            "zip",
+        ]:
+            if sys.version_info >= (3, 9):
+                docstring = pydoc.render_doc(
+                    thing=getattr(input_dp, dp_funcname), forceload=True
+                )
+            elif sys.version_info < (3, 9):
+                # pydoc works differently on Python 3.8, see
+                # https://docs.python.org/3/whatsnew/3.9.html#pydoc
+                docstring = getattr(input_dp, dp_funcname).__doc__
+
+            assert f"(functional name: ``{dp_funcname}``)" in docstring
+            assert "Args:" in docstring
+            assert "Example:" in docstring or "Examples:" in docstring
 
     def test_iterable_wrapper_datapipe(self):
 
@@ -1317,8 +1358,8 @@ class TestFunctionalIterDataPipe(TestCase):
         # Unmatched input columns with fn arguments
         _helper(None, fn_n1, 1, error=ValueError)
         _helper(None, fn_n1, [0, 1, 2], error=ValueError)
-        _helper(None, lambda d0, d1: d0 + d1, 0, error=ValueError)
-        _helper(None, lambda d0, d1: d0 + d1, [0, 1, 2], error=ValueError)
+        _helper(None, operator.add, 0, error=ValueError)
+        _helper(None, operator.add, [0, 1, 2], error=ValueError)
         _helper(None, fn_cmplx, 0, 1, ValueError)
         _helper(None, fn_n1_pos, 1, error=ValueError)
         _helper(None, fn_n1_def, [0, 1, 2], 1, error=ValueError)
@@ -1363,6 +1404,7 @@ class TestFunctionalIterDataPipe(TestCase):
         _helper(lambda data: (data[0] + 1, data[1], data[2]), Add1Callable(), 0)
 
     @suppress_warnings  # Suppress warning for lambda fn
+    @skipIfTorchDynamo()
     def test_map_dict_with_col_iterdatapipe(self):
         def fn_11(d):
             return -d
@@ -1894,6 +1936,34 @@ class TestFunctionalMapDataPipe(TestCase):
                     with self.assertRaises((pickle.PicklingError, AttributeError)):
                         pickle.dumps(datapipe)
 
+    def test_docstring(self):
+        """
+        Ensure functional form of MapDataPipe has the correct docstring from
+        the class form.
+
+        Regression test for https://github.com/pytorch/data/issues/792.
+        """
+        input_dp = dp.map.SequenceWrapper(range(10))
+
+        for dp_funcname in [
+            "batch",
+            "concat",
+            "map",
+            "shuffle",
+            "zip",
+        ]:
+            if sys.version_info >= (3, 9):
+                docstring = pydoc.render_doc(
+                    thing=getattr(input_dp, dp_funcname), forceload=True
+                )
+            elif sys.version_info < (3, 9):
+                # pydoc works differently on Python 3.8, see
+                # https://docs.python.org/3/whatsnew/3.9.html#pydoc
+                docstring = getattr(input_dp, dp_funcname).__doc__
+            assert f"(functional name: ``{dp_funcname}``)" in docstring
+            assert "Args:" in docstring
+            assert "Example:" in docstring or "Examples:" in docstring
+
     def test_sequence_wrapper_datapipe(self):
         seq = list(range(10))
         input_dp = dp.map.SequenceWrapper(seq)
@@ -2185,7 +2255,7 @@ class TestTyping(TestCase):
             self.assertFalse(issubinstance(d, t[int]))  # type: ignore[index]
 
         # dict
-        d = dict({'1': 1, '2': 2.})
+        d = {'1': 1, '2': 2.}
         self.assertTrue(issubinstance(d, Dict))
         self.assertTrue(issubinstance(d, Dict[str, T_co]))
         self.assertFalse(issubinstance(d, Dict[str, int]))
@@ -2696,6 +2766,23 @@ class TestCircularSerialization(TestCase):
         })}
         self.assertEqual(res2, exp_res_2)
 
+
+class CustomShardingIterDataPipe(IterDataPipe):
+    def __init__(self, dp):
+        self.dp = dp
+        self.num_of_instances = 1
+        self.instance_id = 0
+
+    def apply_sharding(self, num_of_instances, instance_id):
+        self.num_of_instances = num_of_instances
+        self.instance_id = instance_id
+
+    def __iter__(self):
+        for i, d in enumerate(self.dp):
+            if i % self.num_of_instances == self.instance_id:
+                yield d
+
+
 class TestSharding(TestCase):
 
     def _get_pipeline(self):
@@ -2802,6 +2889,12 @@ class TestSharding(TestCase):
         with self.assertRaises(Exception):
             dp.apply_sharding(2, 1, sharding_group=LEGACY_SHARDING_PRIORITIES.DEFAULT)
 
+    def test_legacy_custom_sharding(self):
+        dp = self._get_pipeline()
+        sharded_dp = CustomShardingIterDataPipe(dp)
+        torch.utils.data.graph_settings.apply_sharding(sharded_dp, 3, 1)
+        items = list(sharded_dp)
+        self.assertEqual([1, 20], items)
 
     def test_sharding_length(self):
         numbers_dp = dp.iter.IterableWrapper(range(13))
@@ -2830,9 +2923,18 @@ class TestSharding(TestCase):
 
         dp0 = self._get_pipeline().sharding_filter()
         dl = DataLoader(dp0, batch_size=1, shuffle=False, num_workers=2)
-        items = []
-        for i in dl:
-            items.append(i)
+        items = list(dl)
+
+        self.assertEqual(sorted(expected), sorted(items))
+
+    def test_legacy_custom_sharding_with_old_dataloader(self):
+        dp0 = self._get_pipeline()
+        expected = list(dp0)
+
+        dp0 = self._get_pipeline()
+        dp0 = CustomShardingIterDataPipe(dp0)
+        dl = DataLoader(dp0, batch_size=1, shuffle=False, num_workers=2)
+        items = list(dl)
 
         self.assertEqual(sorted(expected), sorted(items))
 

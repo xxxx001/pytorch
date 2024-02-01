@@ -1,6 +1,5 @@
+#include <torch/csrc/profiler/collection.h>
 #include <torch/csrc/profiler/kineto_shim.h>
-
-#include <type_traits>
 
 #ifdef USE_KINETO
 #include <libkineto.h>
@@ -24,15 +23,18 @@ const std::set<libkineto::ActivityType> kCpuTypes{
     libkineto::ActivityType::EXTERNAL_CORRELATION,
     libkineto::ActivityType::XPU_RUNTIME,
     libkineto::ActivityType::CUDA_RUNTIME,
+    libkineto::ActivityType::CUDA_DRIVER,
     libkineto::ActivityType::PYTHON_FUNCTION,
 };
 
 const std::set<libkineto::ActivityType> kCudaTypes = {
     libkineto::ActivityType::GPU_MEMCPY,
     libkineto::ActivityType::GPU_MEMSET,
+    libkineto::ActivityType::GPU_USER_ANNOTATION,
     libkineto::ActivityType::CONCURRENT_KERNEL,
     // CUDA_RUNTIME appears in both kCpuTypes and kCudaTypes.
     libkineto::ActivityType::CUDA_RUNTIME,
+    libkineto::ActivityType::CUDA_DRIVER,
 };
 const std::set<libkineto::ActivityType> kXpuTypes = {
     libkineto::ActivityType::GPU_MEMCPY,
@@ -40,6 +42,10 @@ const std::set<libkineto::ActivityType> kXpuTypes = {
     libkineto::ActivityType::CONCURRENT_KERNEL,
     // XPU_RUNTIME appears in both kCpuTypes and kXpuTypes.
     libkineto::ActivityType::XPU_RUNTIME,
+};
+const std::set<libkineto::ActivityType> kMtiaTypes = {
+    libkineto::ActivityType::MTIA_CCP_EVENTS,
+    libkineto::ActivityType::MTIA_RUNTIME,
 };
 } // namespace
 #endif // USE_KINETO
@@ -59,14 +65,11 @@ const DeviceAndResource kineto_ids() {
 }
 
 void addMetadata(
-    const activity_t* activity,
+    activity_t* activity,
     const std::string& key,
     const std::string& value) {
 #ifdef USE_KINETO
-  // ActivityTraceInterface returns const pointers, so we have to cast away the
-  // constness to add metadata.
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-  const_cast<activity_t*>(activity)->addMetadata(key, value);
+  activity->addMetadata(key, value);
 #endif // USE_KINETO
 }
 
@@ -97,8 +100,7 @@ activity_t* TraceWrapper::addCPUActivity(
   auto& act = libkineto::CpuTraceBuffer::toRef(cpu_trace_->activities.back());
   act.device = device_and_resource.device;
   act.resource = device_and_resource.resource;
-  // NOLINTNEXTLINE
-  act.id = correlation_id;
+  act.id = static_cast<int32_t>(correlation_id);
   act.startTime = start_time;
   if (type != libkineto::ActivityType::CPU_INSTANT_EVENT) {
     act.endTime = end_time;
@@ -196,6 +198,7 @@ class ExperimentalConfigWrapper {
   }
 
  private:
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const torch::profiler::impl::ExperimentalConfig& config_;
 };
 } // namespace
@@ -224,8 +227,15 @@ void prepareTrace(
   if (activities.count(torch::autograd::profiler::ActivityType::XPU)) {
     k_activities.insert(kXpuTypes.begin(), kXpuTypes.end());
   }
+  if (activities.count(torch::autograd::profiler::ActivityType::MTIA)) {
+    k_activities.insert(kMtiaTypes.begin(), kMtiaTypes.end());
+  }
   if (activities.count(torch::autograd::profiler::ActivityType::CUDA)) {
     k_activities.insert(kCudaTypes.begin(), kCudaTypes.end());
+    if (config.enable_cuda_sync_events || get_cuda_sync_enabled()) {
+      LOG(INFO) << "Enabling CUDA Sync Events";
+      k_activities.insert(libkineto::ActivityType::CUDA_SYNC);
+    }
   }
 
   ExperimentalConfigWrapper configWrap(config);
@@ -311,8 +321,11 @@ c10::DeviceType deviceTypeFromActivity(libkineto::ActivityType activity_type) {
     case libkineto::ActivityType::GPU_MEMCPY:
     case libkineto::ActivityType::GPU_MEMSET:
     case libkineto::ActivityType::CONCURRENT_KERNEL:
+    case libkineto::ActivityType::CUDA_SYNC:
     case libkineto::ActivityType::GPU_USER_ANNOTATION:
     case libkineto::ActivityType::CUDA_PROFILER_RANGE:
+    // TODO: T151322015
+    case libkineto::ActivityType::MTIA_CCP_EVENTS:
       return c10::DeviceType::CUDA;
     case libkineto::ActivityType::CPU_OP:
     case libkineto::ActivityType::USER_ANNOTATION:
@@ -320,7 +333,9 @@ c10::DeviceType deviceTypeFromActivity(libkineto::ActivityType activity_type) {
     case libkineto::ActivityType::CUDA_RUNTIME:
     case libkineto::ActivityType::CPU_INSTANT_EVENT:
     case libkineto::ActivityType::GLOW_RUNTIME:
+    case libkineto::ActivityType::MTIA_RUNTIME:
     case libkineto::ActivityType::PYTHON_FUNCTION:
+    case libkineto::ActivityType::CUDA_DRIVER:
       return c10::DeviceType::CPU;
     default: {
       TORCH_WARN(
@@ -347,10 +362,12 @@ void addMetadataJson(const std::string& key, const std::string& value) {
 
 void profilerStep() {
 #ifdef USE_KINETO
+  libkineto::api().initProfilerIfRegistered();
+
   if (libkineto::api().isProfilerInitialized()) {
     libkineto::api().activityProfiler().step();
   } else {
-    LOG(WARNING) << "Profiler is not initialized: skipping step() invocation";
+    VLOG(1) << "Profiler is not initialized: skipping step() invocation";
   }
 #endif // USE_KINETO
 }

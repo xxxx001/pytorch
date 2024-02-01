@@ -1,4 +1,3 @@
-# coding=utf-8
 
 from typing import cast, List
 
@@ -396,7 +395,7 @@ def _handle_row_wise_sharding(
     result = torch.nn.functional.embedding_bag(
         lookup_input,
         torch.cat([local_shard, padding_row]),
-        offsets=offsets_list if offsets is not None else offsets,
+        offsets=offsets_list if offsets is not None else offsets,  # type: ignore[possibly-undefined]
         mode=mode if mode != "mean" else "sum",
         per_sample_weights=per_sample_weights,
         max_norm=max_norm,
@@ -405,7 +404,7 @@ def _handle_row_wise_sharding(
     )
 
     op = ReduceOp.SUM if mode != "max" else ReduceOp.MAX
-    # TODO: Make the result a PartialTensor and move the the logic below there.
+    # TODO: Make the result a PartialTensor and move the logic below there.
     local_shards = result.chunk(pg.size())
     result = reduce_scatter(
         torch.empty_like(local_shards[0]),

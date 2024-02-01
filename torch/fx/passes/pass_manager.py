@@ -1,6 +1,6 @@
 from functools import wraps
 from inspect import unwrap
-from typing import Callable, List
+from typing import Callable, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -69,14 +69,14 @@ def log_hook(fn: Callable, level=logging.INFO) -> Callable:
     @wraps(fn)
     def wrapped_fn(gm):
         val = fn(gm)
-        logger.log(level, f"Ran pass {fn}\t Return value: {val}",)
+        logger.log(level, "Ran pass %s\t Return value: %s", fn, val)
         return val
 
     return wrapped_fn
 
 
 
-def loop_pass(base_pass: Callable, n_iter: int = None, predicate: Callable = None):
+def loop_pass(base_pass: Callable, n_iter: Optional[int] = None, predicate: Optional[Callable] = None):
     """
     Convenience wrapper for passes which need to be applied multiple times.
 
@@ -224,6 +224,16 @@ class PassManager:
         passes_left = []
         for ps in self.passes:
             if ps.__name__ not in _passes:
+                passes_left.append(ps)
+        self.passes = passes_left
+        self._validated = False
+
+    def replace_pass(self, _target, _replacement):
+        passes_left = []
+        for ps in self.passes:
+            if ps.__name__ == _target.__name__:
+                passes_left.append(_replacement)
+            else:
                 passes_left.append(ps)
         self.passes = passes_left
         self._validated = False

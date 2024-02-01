@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Owner(s): ["oncall: jit"]
 
 import unittest
@@ -51,7 +50,7 @@ class TestFuser(JitTestCase):
         allowed_nodes = {'prim::Constant', 'prim::FusionGroup', 'prim::BailoutTemplate',
                          'prim::BailOut', 'prim::TupleConstruct'} | set(except_for)
         self.assertTrue(all(node.kind() in allowed_nodes for node in graph.nodes()),
-                        'got {}'.format(graph))
+                        f'got {graph}')
         self.assertTrue([node.kind() for node in graph.nodes()].count('prim::FusionGroup') == 1)
 
     def _test_fused_abs(self, device='cpu'):
@@ -797,7 +796,7 @@ class TestFuser(JitTestCase):
             FileCheck.check("FusionGroup").run(str(graph))
         except RuntimeError as e:
             if 'Failed to compile' in e.args[0]:
-                warnings.warn('CPU fuser test has failed! This is not a hard failure, '
+                warnings.warn('CPU fuser test has failed! This is not a hard failure, '  # noqa: F821
                               'because the kernels sometimes trigger bugs in compilers '
                               '(most notably GCC 7.2).')
                 raise unittest.SkipTest('Failed to compile') from e

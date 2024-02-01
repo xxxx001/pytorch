@@ -1,6 +1,7 @@
 #pragma once
 #include <ATen/native/TransposeType.h>
 #include <c10/util/complex.h>
+#include <c10/core/ScalarType.h>
 
 namespace at {
 namespace native {
@@ -29,4 +30,15 @@ void mkl_gemm_batched(
     const c10::complex<double>** A, int lda, const c10::complex<double>** B, int ldb,
     c10::complex<double> beta, c10::complex<double>** C, int ldc);
 
+void mkl_gemm_bf16bf16f32(
+    TransposeType trans_A, TransposeType trans_B,
+    int M, int N, int K, const float alpha,
+    const c10::BFloat16* A, int lda, const c10::BFloat16* B, int ldb,
+    const float beta, float* C, int ldc);
+
+void mkl_gemm_f16f16f32(
+    TransposeType trans_A, TransposeType trans_B,
+    int M, int N, int K, const float alpha,
+    const c10::Half* A, int lda, const c10::Half* B, int ldb,
+    const float beta, float* C, int ldc);
 }}  // namespace at::native

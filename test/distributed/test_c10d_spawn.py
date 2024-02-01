@@ -9,7 +9,7 @@ import torch.distributed as c10d
 import torch.multiprocessing as mp
 from torch.testing._internal.common_distributed import \
     MultiProcessTestCase
-from torch.testing._internal.common_utils import load_tests,\
+from torch.testing._internal.common_utils import load_tests, \
     NO_MULTIPROCESSING_SPAWN
 
 # Torch distributed.nn is not available in windows
@@ -57,9 +57,7 @@ class AbstractProcessGroupShareTensorTest:
             self.assertEqual(
                 expected,
                 result,
-                msg=(
-                    "Expect rank {} to receive tensor {} but got {}."
-                ).format(pid, expected, result)
+                msg=f"Expect rank {pid} to receive tensor {expected} but got {result}."
             )
 
         for _ in range(ws):

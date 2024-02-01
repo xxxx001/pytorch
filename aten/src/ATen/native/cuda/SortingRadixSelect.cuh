@@ -2,6 +2,7 @@
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/DeviceUtils.cuh>
 #include <ATen/cuda/AsmUtils.cuh>
+#include <c10/macros/Macros.h>
 
 namespace at {
 namespace native {
@@ -131,7 +132,7 @@ struct TopKTypeConfig<at::Half> {
     RadixType mask = (x & 0x00008000) ? 0x0000ffff : 0x00008000;
     return (v == v) ? (x ^ mask) : 0xffff;
 #else
-    assert(false);
+    CUDA_KERNEL_ASSERT(false);
     return 0u;
 #endif
   }
@@ -141,7 +142,7 @@ struct TopKTypeConfig<at::Half> {
     RadixType mask = (v & 0x00008000) ? 0x00008000 : 0x0000ffff;
     return __ushort_as_half(v ^ mask);
 #else
-    assert(false);
+    CUDA_KERNEL_ASSERT(false);
     return static_cast<at::Half>(0);
 #endif
   }
@@ -199,7 +200,11 @@ __device__ void countRadixUsingMask(
 
   // Scan over all the data. Upon a read, the warp will accumulate
   // counts per each digit in the radix using warp voting.
-  for (index_t i = threadIdx.x; i < sliceSize; i += blockDim.x) {
+#if !defined(USE_ROCM)
+  // Must be called outside of loop to ensure all threads participate
+  unsigned mask = WARP_BALLOT(threadIdx.x < sliceSize);
+#endif
+  for (index_t i = threadIdx.x; i < sliceSize;) {
     bitwise_t val =
         TopKTypeConfig<scalar_t>::convert(doLdg(&data[i * withinSliceStride]));
 
@@ -213,9 +218,13 @@ __device__ void countRadixUsingMask(
 #if defined(USE_ROCM)
       counts[j] += __popcll(WARP_BALLOT(vote));
 #else
-      counts[j] += __popc(WARP_BALLOT(vote, ACTIVE_MASK()));
+      counts[j] += __popc(WARP_BALLOT(vote, mask));
 #endif
     }
+    i += blockDim.x;
+#if !defined(USE_ROCM)
+    mask = WARP_BALLOT(i < sliceSize, mask);
+#endif
   }
 
   // Now, for each warp, sum values
@@ -288,7 +297,7 @@ __device__ scalar_t findPattern(
   }
 
   // should not get here
-  assert(false);
+  CUDA_KERNEL_ASSERT(false);
   return static_cast<scalar_t>(0);
 }
 

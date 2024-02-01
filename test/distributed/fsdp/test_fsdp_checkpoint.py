@@ -100,7 +100,7 @@ class TestFSDPCheckpoint(FSDPTest):
                 l3 = ckpt_wrapper(l3)
 
             fsdp_wrapper = partial(
-                _maybe_wrap_fsdp, wrap_fsdp=wrap_fsdp, *fsdp_args, **fsdp_kwargs
+                _maybe_wrap_fsdp, *fsdp_args, wrap_fsdp=wrap_fsdp, **fsdp_kwargs
             )
             self.ffn = nn.Sequential(
                 fsdp_wrapper(l1),
@@ -257,7 +257,7 @@ class TestFSDPCheckpoint(FSDPTest):
                         offload_ctx = (
                             get_patched_save_on_cpu()(pin_memory=True)
                             if offload_activations
-                            else contextlib.suppress()
+                            else contextlib.nullcontext()
                         )
                         with offload_ctx:
                             out = checkpoint(m, inp, use_reentrant=True)

@@ -14,22 +14,23 @@
 // See https://github.com/pytorch/pytorch/issues/37577 for an instance
 // of this bug in the past.
 
+#include <array>
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <functional>
 #include <cmath>
 #include <type_traits>
-#include <bitset>
 #include <climits>
 
 #include <ATen/cpu/vec/intrinsics.h>
 #include <ATen/native/Math.h>
 #include <ATen/NumericUtils.h>
 #include <c10/util/C++17.h>
+#include <c10/util/Half.h>
 #include <c10/util/BFloat16.h>
 #include <c10/util/BFloat16-math.h>
 #include <c10/util/copysign.h>
-#include <c10/util/math_compat.h>
 #include <ATen/native/cpu/zmath.h>
 #include <c10/util/TypeCast.h>
 #include <c10/macros/Macros.h>
@@ -59,8 +60,7 @@
 #define int_vector __m256i
 #endif // CPU_CAPABILITY_AVX512
 
-namespace at {
-namespace vec {
+namespace at::vec {
 // See Note [CPU_CAPABILITY namespace]
 inline namespace CPU_CAPABILITY {
 // at::Half and at::BFloat16 should be treated as floating point
@@ -71,6 +71,19 @@ struct is_floating_point:
       std::is_same<T, at::Half>::value ||
       std::is_same<T, at::BFloat16>::value> {
 };
+
+template<typename T>
+constexpr bool is_floating_point_v = is_floating_point<T>::value;
+
+template <typename T>
+struct is_reduced_floating_point:
+    std::integral_constant<bool,
+      std::is_same<T, at::Half>::value ||
+      std::is_same<T, at::BFloat16>::value> {
+};
+
+template <typename T>
+constexpr bool is_reduced_floating_point_v = is_reduced_floating_point<T>::value;
 
 template<size_t n> struct int_of_size;
 
@@ -133,9 +146,8 @@ public:
   // versions GCC/Clang have buggy determinations on whether or not an
   // identifier is odr-used or not, and in any case it's hard to tell if
   // a variable is odr-used or not.  So best to just cut the problem at the root.
-  static constexpr size_type size_T = sizeof(T);  // Workaround to compile with VS2022.
   static constexpr size_type size() {
-    return VECTOR_WIDTH / size_T;
+    return VECTOR_WIDTH / sizeof(T);
   }
   Vectorized() : values{static_cast<T>(0)} {}
   Vectorized(T val) {
@@ -241,6 +253,14 @@ public:
     }
     return vector;
   }
+  bool has_inf_nan() const {
+    for (int64_t i = 0; i != size(); i++) {
+      if(_isnan(values[i]) || _isinf(values[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
   Vectorized<T> map(T (*const f)(T)) const {
     Vectorized<T> ret;
     for (int64_t i = 0; i != size(); i++) {
@@ -256,14 +276,14 @@ public:
     return ret;
   }
   template <typename other_t_abs = T,
-            typename std::enable_if<!is_floating_point<other_t_abs>::value && !c10::is_complex<other_t_abs>::value, int>::type = 0>
+            typename std::enable_if<!is_floating_point_v<other_t_abs> && !c10::is_complex<other_t_abs>::value, int>::type = 0>
   Vectorized<T> abs() const {
     // other_t_abs is for SFINAE and clarity. Make sure it is not changed.
     static_assert(std::is_same<other_t_abs, T>::value, "other_t_abs must be T");
     return map([](T x) -> T { return x < static_cast<T>(0) ? -x : x; });
   }
   template <typename float_t_abs = T,
-            typename std::enable_if<is_floating_point<float_t_abs>::value, int>::type = 0>
+            typename std::enable_if<is_floating_point_v<float_t_abs>, int>::type = 0>
   Vectorized<T> abs() const {
     // float_t_abs is for SFINAE and clarity. Make sure it is not changed.
     static_assert(std::is_same<float_t_abs, T>::value, "float_t_abs must be T");
@@ -345,11 +365,17 @@ public:
   Vectorized<T> acos() const {
     return map(std::acos);
   }
+  Vectorized<T> acosh() const {
+    return map(std::acosh);
+  }
   Vectorized<T> asin() const {
     return map(std::asin);
   }
   Vectorized<T> atan() const {
     return map(std::atan);
+  }
+  Vectorized<T> atanh() const {
+    return map(std::atanh);
   }
   Vectorized<T> atan2(const Vectorized<T> &exp) const {
     Vectorized<T> ret;
@@ -360,7 +386,7 @@ public:
   }
   template <
     typename U = T,
-    typename std::enable_if_t<is_floating_point<U>::value, int> = 0>
+    typename std::enable_if_t<is_floating_point_v<U>, int> = 0>
   Vectorized<T> copysign(const Vectorized<T> &sign) const {
     Vectorized<T> ret;
     for (size_type i = 0; i < size(); i++) {
@@ -386,12 +412,15 @@ public:
   Vectorized<T> expm1() const {
     return map(std::expm1);
   }
+  Vectorized<T> exp_u20() const {
+    return map(std::exp);
+  }
   Vectorized<T> frac() const {
     return *this - this->trunc();
   }
   template <
     typename U = T,
-    typename std::enable_if_t<is_floating_point<U>::value, int> = 0>
+    typename std::enable_if_t<is_floating_point_v<U>, int> = 0>
   Vectorized<T> fmod(const Vectorized<T>& q) const {
     // U is for SFINAE purposes only. Make sure it is not changed.
     static_assert(std::is_same<U, T>::value, "U must be T");
@@ -449,6 +478,9 @@ public:
   }
   Vectorized<T> i0e() const {
     return map(calc_i0e);
+  }
+  Vectorized<T> digamma() const {
+    return map(calc_digamma);
   }
   Vectorized<T> igamma(const Vectorized<T> &x) const {
     Vectorized<T> ret;
@@ -944,16 +976,17 @@ inline Vectorized<dst_t> cast(const Vectorized<src_t>& src) {
   return CastImpl<dst_t, src_t>::apply(src);
 }
 
-template <typename T>
-inline Vectorized<int_same_size_t<T>> convert_to_int_of_same_size(const Vectorized<T>& src) {
+template <typename T, typename IntType = int_same_size_t<T>>
+inline Vectorized<IntType> convert_to_int_of_same_size(const Vectorized<T>& src) {
+  static_assert(sizeof(T) == sizeof(IntType));
   static constexpr int size = Vectorized<T>::size();
-  T src_arr[size];
-  src.store(static_cast<void*>(src_arr));
-  int_same_size_t<T> buffer[size];
-  for (const auto i : c10::irange(size)) {
-    buffer[i] = static_cast<int_same_size_t<T>>(src_arr[i]);
-  }
-  return Vectorized<int_same_size_t<T>>::loadu(static_cast<void*>(buffer));
+
+  std::array<T, size> src_arr;
+  src.store(static_cast<void*>(src_arr.data()));
+  std::array<IntType, size> buffer;
+  std::transform(src_arr.cbegin(), src_arr.cend(), buffer.begin(),
+                 [](const T& x) { return static_cast<IntType>(x); });
+  return Vectorized<IntType>::loadu(static_cast<const void*>(buffer.data()));
 }
 
 // Example inputs for AVX512:
@@ -1024,8 +1057,7 @@ inline void convert(const src_T *src, dst_T *dst, int64_t n) {
 #ifndef _MSC_VER
 # pragma unroll
 #endif
-  for (const auto i : c10::irange(n)) {
-    (void)i; //Suppress unused variable warning
+  for (C10_UNUSED const auto i : c10::irange(n)) {
     *dst = c10::convert<dst_T>(c10::load(src));
     src++;
     dst++;
@@ -1055,4 +1087,4 @@ inline void transpose_mxn(const T* src, int64_t ld_src, T* dst, int64_t ld_dst) 
   }
 }
 
-}}}
+}} // namespace at::vec::CPU_CAPABILITY

@@ -30,13 +30,25 @@ class FakeTensorProp(torch.fx.Interpreter):
         self._mode = mode
 
     def run_node(self, n: Node):
+        import sympy
+        from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+
         result = super().run_node(n)
+        sym = None
+        if (
+            'val' in n.meta and
+            isinstance(v := n.meta['val'], torch.SymInt) and
+            isinstance(v.node.expr, sympy.Symbol) and free_unbacked_symbols(v)
+        ):
+            sym = v
 
         def extract_val(obj):
             if isinstance(obj, FakeTensor):
                 return snapshot_fake(obj)
             elif isinstance(obj, torch.Tensor):
-                return snapshot_fake(self._mode.from_tensor(obj))
+                # TODO: How is it possible that we get a non fake tensor?  We
+                # should be running under the mode...
+                return snapshot_fake(self._mode.from_tensor(obj, static_shapes=True))
             elif isinstance(obj, py_sym_types):
                 return obj
             else:
@@ -45,6 +57,8 @@ class FakeTensorProp(torch.fx.Interpreter):
         meta = map_aggregate(result, extract_val)
         if meta is not None:
             n.meta['val'] = meta
+            if sym is not None:
+                torch._check(meta == v)
         return result
 
     def propagate(self, *args):

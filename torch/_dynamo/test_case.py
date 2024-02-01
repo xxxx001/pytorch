@@ -1,18 +1,20 @@
 import contextlib
 import importlib
+import logging
 import sys
 
 import torch
 import torch.testing
-from torch.testing._internal.common_utils import (
+from torch.testing._internal.common_utils import (  # type: ignore[attr-defined]
     IS_WINDOWS,
     TEST_WITH_CROSSREF,
-    TEST_WITH_ROCM,
     TEST_WITH_TORCHDYNAMO,
     TestCase as TorchTestCase,
 )
 
 from . import config, reset, utils
+
+log = logging.getLogger(__name__)
 
 
 def run_tests(needs=()):
@@ -22,8 +24,7 @@ def run_tests(needs=()):
         TEST_WITH_TORCHDYNAMO
         or IS_WINDOWS
         or TEST_WITH_CROSSREF
-        or TEST_WITH_ROCM
-        or sys.version_info >= (3, 11)
+        or sys.version_info >= (3, 12)
     ):
         return  # skip testing
 
@@ -43,18 +44,23 @@ def run_tests(needs=()):
 class TestCase(TorchTestCase):
     @classmethod
     def tearDownClass(cls):
-        cls._exit_stack.close()
+        cls._exit_stack.close()  # type: ignore[attr-defined]
         super().tearDownClass()
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls._exit_stack = contextlib.ExitStack()
-        cls._exit_stack.enter_context(
-            config.patch(raise_on_ctx_manager_usage=True, suppress_errors=False),
+        cls._exit_stack = contextlib.ExitStack()  # type: ignore[attr-defined]
+        cls._exit_stack.enter_context(  # type: ignore[attr-defined]
+            config.patch(
+                raise_on_ctx_manager_usage=True,
+                suppress_errors=False,
+                log_compilation_metrics=False,
+            ),
         )
 
     def setUp(self):
+        self._prior_is_grad_enabled = torch.is_grad_enabled()
         super().setUp()
         reset()
         utils.counters.clear()
@@ -65,3 +71,6 @@ class TestCase(TorchTestCase):
         reset()
         utils.counters.clear()
         super().tearDown()
+        if self._prior_is_grad_enabled is not torch.is_grad_enabled():
+            log.warning("Running test changed grad mode")
+            torch.set_grad_enabled(self._prior_is_grad_enabled)

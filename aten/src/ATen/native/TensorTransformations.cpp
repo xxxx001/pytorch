@@ -17,6 +17,7 @@
 #include <ATen/ops/atleast_2d_native.h>
 #include <ATen/ops/atleast_3d_native.h>
 #include <ATen/ops/cat.h>
+#include <ATen/ops/chalf_native.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/flip_native.h>
 #include <ATen/ops/fliplr_native.h>
@@ -30,8 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 Tensor flip(const Tensor& self, IntArrayRef dims) {
   const int64_t total_dims = self.dim();
@@ -236,4 +236,4 @@ Tensor chalf(const Tensor& self, c10::optional<MemoryFormat> memory_format) {
 
 DEFINE_DISPATCH(flip_stub);
 
-}} // namespace at::native
+} // namespace at::native

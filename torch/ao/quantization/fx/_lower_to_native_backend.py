@@ -170,6 +170,8 @@ def is_general_tensor_shape_node(node, modules):
     ]
     module_type_list = [
         torch.nn.Identity,
+        torch.nn.PixelShuffle,
+        torch.nn.PixelUnshuffle,
     ]
     return _is_node_in_list(node, modules, func_list, method_list, module_type_list)
 
@@ -293,11 +295,14 @@ DYNAMIC_LOWER_FUSED_MODULE_MAP: Dict[Type[nn.Module], Tuple[Type[nn.Module], Typ
 # Mapping from a functional to lower to a 2-tuple of
 #   1) The quantized version of the op
 #   2) The quantized version of the op fused with relu, if it exists, else None
-STATIC_LOWER_FUNCTIONAL_MAP: Dict[Callable, Tuple[Callable, Callable]] = {
+STATIC_LOWER_FUNCTIONAL_MAP: Dict[Callable, Tuple[Callable, Optional[Callable]]] = {
     F.linear: (torch.ops.quantized.linear, torch.ops.quantized.linear_relu),
     F.conv1d: (torch.ops.quantized.conv1d, torch.ops.quantized.conv1d_relu),
     F.conv2d: (torch.ops.quantized.conv2d, torch.ops.quantized.conv2d_relu),
     F.conv3d: (torch.ops.quantized.conv3d, torch.ops.quantized.conv3d_relu),
+    F.conv_transpose1d: (torch.ops.quantized.conv_transpose1d, None),
+    F.conv_transpose2d: (torch.ops.quantized.conv_transpose2d, None),
+    F.conv_transpose3d: (torch.ops.quantized.conv_transpose3d, None),
 }
 
 WEIGHT_PREPACK_OPS: Set[Callable] = {
@@ -306,6 +311,9 @@ WEIGHT_PREPACK_OPS: Set[Callable] = {
     torch._ops.ops.quantized.conv1d_prepack,
     torch._ops.ops.quantized.conv2d_prepack,
     torch._ops.ops.quantized.conv3d_prepack,
+    torch.ops.quantized.conv_transpose1d_prepack,
+    torch.ops.quantized.conv_transpose2d_prepack,
+    torch.ops.quantized.conv_transpose3d_prepack,
 }
 
 # Mapping from a functional to a dictionary, where the key is a 2-tuple of
@@ -337,10 +345,18 @@ CONV_FUNCTIONAL_OPS: Set[Callable] = {
     F.conv3d,
 }
 
+CONV_TRANSPOSE_FUNCTIONAL_OPS: Set[Callable] = {
+    F.conv_transpose1d,
+    F.conv_transpose2d,
+    F.conv_transpose3d,
+}
+
+# TODO: add tests for lowering these ops
 QBIN_OP_MAPPING: Dict[Union[Callable, str], Callable] = {
     operator.add: torch.ops.quantized.add,
     torch.add: torch.ops.quantized.add,
     operator.mul: torch.ops.quantized.mul,
+    operator.matmul: torch.ops.quantized.matmul,
     torch.mul: torch.ops.quantized.mul,
     torch.matmul: torch.ops.quantized.matmul,
 }
@@ -407,7 +423,7 @@ def fold_weight(
         if prepack_node is node:
             packed_weight = packed_weights[node.name]
             # add a prepacked attribute to root
-            op_node = list(prepack_node.users)[0]
+            op_node = next(iter(prepack_node.users))
             module_path, _ = node_name_to_scope[op_node.name]
             get_new_packed_weight_name = \
                 get_new_attr_name_with_prefix(module_path + '_packed_weight_')
@@ -471,14 +487,14 @@ def _match_static_pattern(
         return SKIP_LOWERING_VALUE
     q_node = node
     ref_node = q_node.args[0]
-    assert(isinstance(ref_node, Node))
+    assert isinstance(ref_node, Node)
 
     # Handle cases where the node is wrapped in a ReLU
     if (ref_node.op == "call_function" and ref_node.target in (F.relu, torch.relu)) or\
             (ref_node.op == "call_module" and type(_get_module(ref_node, modules)) == nn.ReLU):
         relu_node = ref_node
         ref_node = relu_node.args[0]
-        assert(isinstance(ref_node, Node))
+        assert isinstance(ref_node, Node)
     else:
         relu_node = None
     if should_skip_lowering(ref_node, qconfig_map):
@@ -499,8 +515,8 @@ def _match_static_pattern(
     # (2) There must be at least one dequantize node
     matched_dequantize = False
     for i in dequantize_node_arg_indices:
-        assert i < len(ref_node.args),\
-            "Dequantize index %s exceeded reference node's arg length %s" % (i, len(ref_node.args))
+        assert i < len(ref_node.args), \
+            f"Dequantize index {i} exceeded reference node's arg length {len(ref_node.args)}"
         arg = ref_node.args[i]
         if is_dequantize_node(arg):
             matched_dequantize = True
@@ -541,7 +557,7 @@ def _match_static_pattern_with_two_inputs(
         return SKIP_LOWERING_VALUE
     q_node = node
     ref_node = q_node.args[0]
-    assert(isinstance(ref_node, Node))
+    assert isinstance(ref_node, Node)
 
     if should_skip_lowering(ref_node, qconfig_map):
         return SKIP_LOWERING_VALUE
@@ -583,13 +599,13 @@ def _lower_static_weighted_ref_module(
             n, modules, qconfig_map, matching_modules, dequantize_node_arg_indices=[0])  # type: ignore[arg-type]
         if q_node is None:
             continue
-        assert(ref_node is not None)
+        assert ref_node is not None
         (_, scale_node, zero_point_node, _) = q_node.args
         ref_module = _get_module(ref_node, modules)
         ref_class = type(ref_module)
-        assert(isinstance(scale_node, Node))
-        assert(isinstance(zero_point_node, Node))
-        assert(issubclass(ref_class, nn.Module))
+        assert isinstance(scale_node, Node)
+        assert isinstance(zero_point_node, Node)
+        assert issubclass(ref_class, nn.Module)
 
         # Step 1: Change this pattern to use the corresponding quantized module
         # For fused modules, we also check whether the inner module is a reference module
@@ -608,9 +624,9 @@ def _lower_static_weighted_ref_module(
         setattr(modules[parent_name], module_name, q_module)
 
         # Step 2: Reroute around dq_node, and remove q_node and its args
-        assert(len(ref_node.args) == 1)
+        assert len(ref_node.args) == 1
         dq_node = ref_node.args[0]
-        assert(isinstance(dq_node, Node))
+        assert isinstance(dq_node, Node)
         ref_node.replace_input_with(dq_node, dq_node.args[0])
         q_node.replace_all_uses_with(ref_node)
         model.graph.erase_node(q_node)
@@ -639,13 +655,13 @@ def _lower_static_weighted_ref_module_with_two_inputs(
             n, modules, qconfig_map, matching_modules)  # type: ignore[arg-type]
         if q_node is None:
             continue
-        assert(ref_node is not None)
+        assert ref_node is not None
         (_, scale_node, zero_point_node, _) = q_node.args
         ref_module = _get_module(ref_node, modules)
         ref_class = type(ref_module)
-        assert(isinstance(scale_node, Node))
-        assert(isinstance(zero_point_node, Node))
-        assert(issubclass(ref_class, nn.Module))
+        assert isinstance(scale_node, Node)
+        assert isinstance(zero_point_node, Node)
+        assert issubclass(ref_class, nn.Module)
 
         # Step 1: Change this pattern to use the corresponding quantized module
         # For fused modules, we also check whether the inner module is a reference module
@@ -664,12 +680,12 @@ def _lower_static_weighted_ref_module_with_two_inputs(
         setattr(modules[parent_name], module_name, q_module)
 
         # Step 2: Reroute around dq_node, and remove q_node and its args
-        assert(len(ref_node.args) == 2)
+        assert len(ref_node.args) == 2
         for arg in ref_node.args:
             if not is_dequantize_node(arg):
                 continue
             dq_node = arg
-            assert(isinstance(dq_node, Node))
+            assert isinstance(dq_node, Node)
             ref_node.replace_input_with(dq_node, dq_node.args[0])
 
         q_node.replace_all_uses_with(ref_node)
@@ -743,7 +759,7 @@ def _lower_weight_only_weighted_ref_module(model: GraphModule):
         # TODO: maybe define a WeightedWeightOnlyQuantizedModule
         q_module = q_class.from_reference(ref_module)  # type: ignore[union-attr]
 
-        # replace reference moduel with dynamically quantized module
+        # replace reference module with dynamically quantized module
         parent_name, module_name = _parent_name(ref_node.target)
         setattr(named_modules[parent_name], module_name, q_module)
 
@@ -762,14 +778,14 @@ def _lower_static_weighted_ref_functional(
             n, modules, qconfig_map, matching_ops, dequantize_node_arg_indices=[0, 1])
         if q_node is None:
             continue
-        assert(func_node is not None)
+        assert func_node is not None
         (_, output_scale_node, output_zp_node, _) = q_node.args
         (input_dq_node, weight_dq_node, *remaining_func_args) = func_node.args
-        assert(isinstance(output_zp_node, Node))
-        assert(isinstance(input_dq_node, Node))
-        assert(isinstance(weight_dq_node, Node))
+        assert isinstance(output_zp_node, Node)
+        assert isinstance(input_dq_node, Node)
+        assert isinstance(weight_dq_node, Node)
         quantized_weight = weight_dq_node.args[0]
-        assert(isinstance(quantized_weight, Node))
+        assert isinstance(quantized_weight, Node)
         if quantized_weight.op != "call_function" or\
                 quantized_weight.target not in (torch.quantize_per_tensor, torch.quantize_per_channel):
             continue
@@ -790,8 +806,22 @@ def _lower_static_weighted_ref_functional(
                 for i in [2, 3, 4]:
                     if len(prepack_args) > i and isinstance(prepack_args[i], int):
                         prepack_args[i] = (prepack_args[i],)
+        elif func_node.target in CONV_TRANSPOSE_FUNCTIONAL_OPS:
+            prepack_op = get_qconv_prepack_op(func_node.target)  # type: ignore[arg-type]
+            # For conv_transpose1d, the stride, padding, and dilation args may be ints,
+            # in which case we need to convert them to tuples
+            if func_node.target == F.conv_transpose1d:
+                # Note prepack_args[5] is groups.
+                for i in [2, 3, 4, 6]:
+                    if len(prepack_args) > i and isinstance(prepack_args[i], int):
+                        prepack_args[i] = (prepack_args[i],)
+            # swap dilation and groups
+            # prepack op has arguments: {w, b, stride, padding, output_padding, dilation, groups}
+            # transposed conv op has arguments: {x, w, b, stride, padding, output_padding, groups, dilation}
+            if (len(prepack_args) > 6):
+                prepack_args[5], prepack_args[6] = prepack_args[6], prepack_args[5]
         else:
-            raise ValueError("Lowering is not supported for op '%s'" % func_node.target)
+            raise ValueError(f"Lowering is not supported for op '{func_node.target}'")
         with model.graph.inserting_before(output_scale_node):
             # kwargs of the func node are needed for prepack op (i.e., quantized::linear_prepack)
             # They are not needed for compute op (i.e., quantized::linear)
@@ -805,8 +835,13 @@ def _lower_static_weighted_ref_functional(
 
         # Step 2: Replace reference pattern with the corresponding quantized op
         (q_func, q_relu_func) = STATIC_LOWER_FUNCTIONAL_MAP[func_node.target]  # type: ignore[index]
-        func_node.target = q_relu_func if relu_node is not None else q_func
+        # conv_transpose does not support fusion with relu yet. q_relu_func is None in such cases
+        if q_relu_func is not None:
+            func_node.target = q_relu_func if relu_node is not None else q_func
+        else:
+            func_node.target = q_func
         func_node.args = (input_dq_node.args[0], packed_weight, output_scale_node, output_zp_node)
+        # kwargs for func_node has been moved to kwargs for prepack op
         func_node.kwargs = {}
         q_node.replace_all_uses_with(func_node)
         # Move func_node after output_zp_node in the graph
@@ -814,7 +849,7 @@ def _lower_static_weighted_ref_functional(
 
         # Clean up: Remove quantize node, and the relu node if it exists
         model.graph.erase_node(q_node)
-        if relu_node is not None:
+        if relu_node is not None and q_relu_func is not None:
             model.graph.erase_node(relu_node)
 
 def _lower_dynamic_weighted_ref_functional(
@@ -902,7 +937,7 @@ def _lower_dynamic_weighted_ref_functional(
                     if len(prepack_args) > i and isinstance(prepack_args[i], int):
                         prepack_args[i] = (prepack_args[i],)
         else:
-            raise ValueError("Lowering is not supported for op '%s'" % func_node.target)
+            raise ValueError(f"Lowering is not supported for op '{func_node.target}'")
         with model.graph.inserting_before(func_node):
             packed_weight = model.graph.create_node("call_function", prepack_op, tuple(prepack_args), {})
 
@@ -931,7 +966,7 @@ def _lower_quantized_binary_op(
             n, modules, qconfig_map, binary_ops_to_lower, dequantize_node_arg_indices=[0, 1])
         if q_node is None:
             continue
-        assert(bop_node is not None)
+        assert bop_node is not None
         (_, scale_node, zero_point_node, _) = q_node.args
 
         # Step 1: Remove dequant nodes
@@ -940,17 +975,17 @@ def _lower_quantized_binary_op(
             if not is_dequantize_node(arg):
                 continue
             dq_node = arg
-            assert(isinstance(dq_node, Node))
+            assert isinstance(dq_node, Node)
             dn_input = dq_node.args[0]
             bop_node.replace_input_with(dq_node, dn_input)
             num_dq_nodes += 1
-        assert(num_dq_nodes > 0)
+        assert num_dq_nodes > 0
 
         # Step 2: Swap binary op to quantized binary op
         assert bop_node.target in QBIN_OP_MAPPING
         binop_to_qbinop = QBIN_OP_MAPPING if relu_node is None else QBIN_RELU_OP_MAPPING
         qbin_op = binop_to_qbinop[bop_node.target]
-        # prepare the args for quantized bianry op
+        # prepare the args for quantized binary op
         # (x, y)
         qop_node_args = list(bop_node.args)
         # (x, y, scale, zero_point)
@@ -1002,7 +1037,7 @@ def special_pattern_replacement(model: GraphModule):
         if not (is_call_module or is_call_function or is_call_method):
             continue
         assert len(ref_node.args) > 0 or len(ref_node.kwargs) > 0
-        dq_node_or_nodes = ref_node.args[0] if len(ref_node.args) > 0 else list(ref_node.kwargs.values())[0]
+        dq_node_or_nodes = ref_node.args[0] if len(ref_node.args) > 0 else next(iter(ref_node.kwargs.values()))
         assert isinstance(dq_node_or_nodes, (Node, tuple, list))
         is_dequantize = False
         if isinstance(dq_node_or_nodes, Node):

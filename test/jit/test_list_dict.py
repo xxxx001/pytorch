@@ -18,7 +18,7 @@ from torch.testing import FileCheck
 pytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(pytorch_test_dir)
 from torch.testing._internal.jit_utils import JitTestCase, make_global
-from torch.testing._internal.common_utils import skipIfTorchDynamo
+from torch.testing._internal.common_utils import skipIfTorchDynamo, TEST_CUDA
 
 if __name__ == '__main__':
     raise RuntimeError("This test file is not meant to be run directly, use:\n\n"
@@ -263,7 +263,7 @@ class TestList(JitTestCase):
 
     def test_dict_keyword_with_mapping(self):
         def fn():
-            return dict({"foo" : 1, "bar" : 2, "baz" : 3})
+            return {"foo" : 1, "bar" : 2, "baz" : 3}
 
         self.checkScript(fn, ())
 
@@ -275,7 +275,7 @@ class TestList(JitTestCase):
 
     def test_dict_keyword_with_dict_comprehension(self):
         def fn():
-            return dict({i: chr(i + 65) for i in range(4)})
+            return {i: chr(i + 65) for i in range(4)}
 
         self.checkScript(fn, ())
 
@@ -287,7 +287,7 @@ class TestList(JitTestCase):
 
     def test_dict_keyword_with_empty_dict_comprehension(self):
         def fn():
-            return dict({})
+            return {}
 
         self.checkScript(fn, ())
 
@@ -1329,12 +1329,9 @@ class TestList(JitTestCase):
                 (torch.ones(5, dtype=torch.long),),
             )
 
-
+    @unittest.skipIf(not TEST_CUDA, 'CUDA not available')
     def test_to_list_gpu(self):
         """GPU tests for Tensor.tolist() function."""
-        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
-            self.skipTest("CUDA is not available")
-
         def to_list_bool_1D(x: torch.Tensor) -> List[bool]:
             li = torch.jit.annotate(List[bool], x.tolist())
             return li
@@ -1471,7 +1468,7 @@ class TestDict(JitTestCase):
 
         def test_dictcomprehension_is_typed_from_annotation():
             metasyntactics = ["foo", "bar", "baz"]
-            x: Dict[str, Optional[int]] = {word: None for word in metasyntactics}
+            x: Dict[str, Optional[int]] = {word: None for word in metasyntactics}  # noqa: RUF025
             return x
 
         self.checkScript(test_dictcomprehension_is_typed_from_annotation, ())
@@ -1964,7 +1961,7 @@ class TestNamedTuple(JitTestCase):
                 self.configs = configs
 
             def forward(self, x):
-                for _id, config in self.configs.items():
+                for config in self.configs.values():
                     x += config.size
                 return x
 
@@ -2629,7 +2626,7 @@ class TestScriptList(JitTestCase):
                 return self
 
             def __next__(self):
-                if self.value == limit:
+                if self.value == limit:  # noqa: F821
                     raise StopIteration()
 
                 ret = self.value

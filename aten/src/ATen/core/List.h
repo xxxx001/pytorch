@@ -24,9 +24,7 @@ namespace detail {
 struct ListImpl final : public c10::intrusive_ptr_target {
   using list_type = std::vector<IValue>;
 
-  explicit ListImpl(list_type list_, TypePtr elementType_)
-  : list(std::move(list_))
-  , elementType(std::move(elementType_)) {}
+  explicit TORCH_API ListImpl(list_type list_, TypePtr elementType_);
 
   list_type list;
 
@@ -80,7 +78,7 @@ public:
   ListElementReference& operator=(const T& new_value) &&;
 
   // assigning another ref to this assigns the underlying value
-  ListElementReference& operator=(ListElementReference&& rhs) &&;
+  ListElementReference& operator=(ListElementReference&& rhs) && noexcept;
 
   const IValue& get() const& {
     return *iterator_;
@@ -126,7 +124,7 @@ class ListIterator final {
   ListIterator(const ListIterator&) = default;
   ListIterator(ListIterator&&) noexcept = default;
   ListIterator& operator=(const ListIterator&) = default;
-  ListIterator& operator=(ListIterator&&) = default;
+  ListIterator& operator=(ListIterator&&) noexcept = default;
 
   ListIterator& operator++() {
       ++iterator_;
@@ -287,7 +285,7 @@ public:
    * Returns the element at specified location pos, with bounds checking.
    * If pos is not within the range of the container, an exception of type std::out_of_range is thrown.
    */
-  value_type get(size_type pos) const;
+  internal_const_reference_type get(size_type pos) const;
 
   /**
    * Moves out the element at the specified location pos and returns it, with bounds checking.
@@ -480,9 +478,7 @@ namespace impl {
 // (maybe except for some internal prim ops).
 using GenericList = List<IValue>;
 
-inline const IValue* ptr_to_first_element(const GenericList& list) {
-  return &list.impl_->list[0];
-}
+const IValue* ptr_to_first_element(const GenericList& list);
 
 }
 }

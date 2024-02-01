@@ -113,7 +113,7 @@ namespace {
 // - when we resize to a larger size, it acts as a mutation
 // - when we resize to a smaller size, it acts as a view
 // See Note [resize_ in Functionalization] for more dtails
-const at::Tensor & resize__functionalization(c10::DispatchKeySet dispatchKeySet, const at::Tensor & self, at::IntArrayRef size, c10::optional<at::MemoryFormat> memory_format) {
+static const at::Tensor & resize__functionalization(c10::DispatchKeySet dispatchKeySet, const at::Tensor & self, at::IntArrayRef size, c10::optional<at::MemoryFormat> memory_format) {
   // First unwrap the tensor arguments
   at::Tensor self_;
   if (at::functionalization::impl::isFunctionalTensor(self)) {
@@ -173,28 +173,40 @@ const at::Tensor & resize__functionalization(c10::DispatchKeySet dispatchKeySet,
 }
 
 
-at::Tensor lift_functionalize(const at::Tensor & self) {
+static at::Tensor lift_functionalize(const at::Tensor & self) {
   TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(self));
   at::AutoDispatchSkipFunctionalize guard;
   auto out = at::lift(self);
   return at::functionalization::impl::to_functional_tensor(out);
 }
 
-at::Tensor lift_fresh_functionalize(const at::Tensor & self) {
-  TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(self));
+static at::Tensor lift_fresh_functionalize(const at::Tensor & self) {
+  // See Note [Exporting and compiling a graph with lift_fresh_copy]
+  if (at::functionalization::impl::isFunctionalTensor(self)) {
+    return self.view_as(self);
+  }
+
   at::AutoDispatchSkipFunctionalize guard;
   auto out = at::lift_fresh(self);
   return at::functionalization::impl::to_functional_tensor(out);
 }
 
-at::Tensor lift_fresh_functionalize_copy(const at::Tensor & self) {
-  TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(self));
+static at::Tensor lift_fresh_functionalize_copy(const at::Tensor & self) {
+  // Note [Exporting and compiling a graph with lift_fresh_copy]
+  // If out is already a functional tensor, don't wrap it twice.
+  // In theory this could be useful if we want to nest functionalization with itself,
+  // but that isn't really a use case today.
+  // Needed for https://github.com/pytorch/pytorch/issues/105327
+  if (at::functionalization::impl::isFunctionalTensor(self)) {
+    return self.clone();
+  }
+
   at::AutoDispatchSkipFunctionalize guard;
   auto out = at::lift_fresh_copy(self);
   return at::functionalization::impl::to_functional_tensor(out);
 }
 
-bool device_opted_into_functionalization(c10::Device self_device, c10::optional<c10::Device> tgt_device) {
+static bool device_opted_into_functionalization(c10::Device self_device, c10::optional<c10::Device> tgt_device) {
     // If the target device is empty, then the output tensor should be on the same device as the input
     auto real_tgt_device = tgt_device.has_value() ? tgt_device.value() : self_device;
     return real_tgt_device.type() == c10::DeviceType::XLA || real_tgt_device.type() == c10::DeviceType::Lazy;
@@ -202,7 +214,7 @@ bool device_opted_into_functionalization(c10::Device self_device, c10::optional<
 
 // note I only need this because the to.dtype/to.dtype_layout overload calls this, so we skip the op above.
 // We should probably get rid of this though.
-at::Tensor _to_copy_functionalize(
+static at::Tensor _to_copy_functionalize(
         const at::Tensor & self,
         c10::optional<at::ScalarType> dtype,
         c10::optional<at::Layout> layout,
@@ -255,7 +267,7 @@ at::Tensor _to_copy_functionalize(
 // The idea with _unsafe_view is that you're guaranteed that the input
 // is a temporary, and don't actually have to worry about propagating
 // mutations between the input and output.
-at::Tensor _unsafe_view_functionalize(const at::Tensor & self, at::SymIntArrayRef size) {
+static at::Tensor _unsafe_view_functionalize(const at::Tensor & self, at::SymIntArrayRef size) {
   if (!at::functionalization::impl::isFunctionalTensor(self)) {
     at::AutoDispatchSkipFunctionalize guard;
     return at::_unsafe_view_symint(self, size);
@@ -287,6 +299,28 @@ at::Tensor _unsafe_view_functionalize(const at::Tensor & self, at::SymIntArrayRe
   return out;
 }
 
+static at::Tensor& set__functionalize(at::Tensor& self, const at::Tensor& src) {
+  // error case
+  TORCH_CHECK(at::functionalization::impl::isFunctionalTensor(self) || !at::functionalization::impl::isFunctionalTensor(src),
+    "set__functionalize: Tried to mutate a non-functional tensor with a functional tensor, which is not allowed");
+
+  TORCH_CHECK(at::functionalization::impl::isFunctionalTensor(src),
+    "set__functionalize: We do not currently support x.set_(y) where y is not a FunctionalTensor. Please file an issue");
+
+  // nop case
+  if (!at::functionalization::impl::isFunctionalTensor(self) && !at::functionalization::impl::isFunctionalTensor(src)) {
+    at::AutoDispatchSkipFunctionalize guard;
+    return self.set_(src);
+  }
+
+  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(self));
+  TORCH_INTERNAL_ASSERT(at::functionalization::impl::isFunctionalTensor(src));
+  auto self_impl = at::functionalization::impl::unsafeGetFunctionalWrapper(self);
+  auto src_impl = at::functionalization::impl::unsafeGetFunctionalWrapper(src);
+  self_impl->set__impl(src_impl);
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(_, Functionalize, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&functionalizeFallback>());
 }
@@ -298,4 +332,7 @@ TORCH_LIBRARY_IMPL(aten, Functionalize, m) {
   m.impl("lift_fresh_copy", TORCH_FN(lift_fresh_functionalize_copy));
   m.impl("_to_copy", TORCH_FN(_to_copy_functionalize));
   m.impl("_unsafe_view", TORCH_FN(_unsafe_view_functionalize));
+  // The overloads of set_() that take in a storage should never
+  // appear with torch.compile, because dynamo graph breaks
+  m.impl("set_.source_Tensor", TORCH_FN(set__functionalize));
 }

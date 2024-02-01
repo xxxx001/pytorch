@@ -382,7 +382,7 @@ class TestTyping(JitTestCase):
             @torch.jit.script
             def outer_scope_cannot_access_comprehension_variables():
                 d = {i : chr(i + 65) for i in range(4)}
-                i = i + 1
+                i = i + 1  # noqa: F821
 
     def test_for_tuple_assign(self):
         def test_simple_assign(x):
@@ -596,7 +596,7 @@ class TestTyping(JitTestCase):
     def test_namedtuple_error_source_attribution(self):
         class _NamedTupleBadMemberType(NamedTuple):
             f1: torch.Tensor
-            f2: "ABadForwardRefType"
+            f2: "ABadForwardRefType"  # noqa: F821
 
         make_global(_NamedTupleBadMemberType)  # see [local resolution in python]
 
@@ -607,3 +607,37 @@ class TestTyping(JitTestCase):
         # note the " +" is regex (i.e. "at least one space")
         with self.assertRaisesRegex(ValueError, "at +File"):
             torch.jit.script(fn)
+
+    def test_inherited_annotations_python_310(self):
+        # See #104484
+        # In python >=3.10, inspect.get_annotations doesn't always return the same values.
+        # Sometimes it will show all annotations; other times it will show only annotations
+        # that show in that class, not classes it inherits fro.
+        class BaseModule(torch.nn.Module):
+            state: List[int]
+
+            def forward(self, x):
+                pass
+
+        def do_something_with_list(x: List[int]):
+            if x:
+                return x[-1]
+            return 5
+
+        class Submodule(BaseModule):
+            def __init__(self, self_x_value):
+                super().__init__()
+                self.x = self_x_value
+                self.state = []
+
+            def forward(self, x):
+                return self.x + x + do_something_with_list(self.state)
+
+        class LowestModule(Submodule):
+            def __init__(self):
+                super().__init__(123)
+
+        mod = LowestModule()
+        mod2 = LowestModule()
+        mod_s = torch.jit.script(mod)
+        mod2_s = torch.jit.script(mod2)

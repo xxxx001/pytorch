@@ -3,9 +3,6 @@
 Complex Numbers
 ===============
 
-.. note:: When using complex numbers, use Pytorch with CUDA 11.6 downloaded via pip wheel as described in
-   `Get Started <https://pytorch.org/get-started/locally/>`__ and select the CUDA 11.6 pip package.
-
 Complex numbers are numbers that can be expressed in the form :math:`a + bj`, where a and b are real numbers,
 and *j* is called the imaginary unit, which satisfies the equation :math:`j^2 = -1`. Complex numbers frequently occur in mathematics and
 engineering, especially in topics like signal processing. Traditionally many users and libraries (e.g., TorchAudio) have
@@ -110,7 +107,7 @@ The angle and absolute values of a complex tensor can be computed using :func:`t
 Linear Algebra
 --------------
 
-Many linear algebra operations, like :func:`torch.matmul`, :func:`torch.svd`, :func:`torch.solve` etc., support complex numbers.
+Many linear algebra operations, like :func:`torch.matmul`, :func:`torch.linalg.svd`, :func:`torch.linalg.solve` etc., support complex numbers.
 If you'd like to request an operation we don't currently support, please `search <https://github.com/pytorch/pytorch/issues?q=is%3Aissue+is%3Aopen+complex>`_
 if an issue has already been filed and if not, `file one <https://github.com/pytorch/pytorch/issues/new/choose>`_.
 

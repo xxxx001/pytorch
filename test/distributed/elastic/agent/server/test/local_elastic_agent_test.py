@@ -112,6 +112,14 @@ def _bipolar_function():
         _sad_function()
 
 
+def _bipolar_sleep_function(sleep_sec):
+    rank = int(os.environ["RANK"])
+    if rank % 2 == 0:
+        _sleep(sleep_sec)
+    else:
+        _sad_function()
+
+
 def _dist_sum(wait=0):
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -173,7 +181,7 @@ def _check_env_function():
         "TORCHELASTIC_MAX_RESTARTS",
         "TORCHELASTIC_RUN_ID",
         "TORCHELASTIC_USE_AGENT_STORE",
-        "NCCL_ASYNC_ERROR_HANDLING",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
     ]
     for var in env_vars:
         _ = os.environ[var]
@@ -300,13 +308,18 @@ class LocalElasticAgentTest(unittest.TestCase):
         )
 
     def get_agent(
-        self, spec: WorkerSpec, start_method: str = "spawn", exit_barrier_timeout=5
+        self,
+        spec: WorkerSpec,
+        start_method: str = "spawn",
+        exit_barrier_timeout=5,
+        log_line_prefix_template: Optional[str] = None,
     ) -> LocalElasticAgent:
         return LocalElasticAgent(
             spec,
             start_method=start_method,
             exit_barrier_timeout=exit_barrier_timeout,
             log_dir=self.log_dir(),
+            log_line_prefix_template=log_line_prefix_template,
         )
 
     # pyre-fixme[56]: Pyre was not able to infer the type of the decorator
@@ -324,10 +337,12 @@ class LocalElasticAgentTest(unittest.TestCase):
         master_addr_override: Optional[str] = None,
         master_port_override: Optional[int] = None,
         is_host=True,
+        monitor_interval=0.01,
+        log_line_prefix_template: Optional[str] = None,
     ) -> Optional[RunResult]:
         """
         Runs a single agent. This method can be called either on a separate process
-        or the main test process. When calling this method on a sparate process make
+        or the main test process. When calling this method on a separate process make
         sure to pass the ``agent_results`` multiprocessing Queue so that the agent's
         run results can be returned. If ``agent_results`` is omitted, then the
         run result is returned from the method.
@@ -341,11 +356,13 @@ class LocalElasticAgentTest(unittest.TestCase):
             master_addr_override=master_addr_override,
             master_port_override=master_port_override,
             is_host=is_host,
+            monitor_interval=monitor_interval,
         )
         agent = self.get_agent(
             spec=spec,
             start_method=start_method,
             exit_barrier_timeout=exit_barrier_timeout,
+            log_line_prefix_template=log_line_prefix_template,
         )
 
         result = agent.run()
@@ -361,7 +378,10 @@ class LocalElasticAgentTest(unittest.TestCase):
                 return result
 
     def run_job(
-        self, node_configs: List[Conf], exit_barrier_timeout: int = 5
+        self,
+        node_configs: List[Conf],
+        exit_barrier_timeout: int = 5,
+        log_line_prefix_template: Optional[str] = None,
     ) -> Dict[str, List[RunResult]]:
         """
         Simulates running a distributed job by running multiple agents
@@ -388,6 +408,8 @@ class LocalElasticAgentTest(unittest.TestCase):
                 "max_restarts": 0,
                 "exit_barrier_timeout": exit_barrier_timeout,
                 "is_host": node_idx == 0,
+                "log_line_prefix_template": log_line_prefix_template
+
             }
             p = mp.Process(target=self.run_agent, kwargs=run_agent_args)
             procs.append(p)
@@ -493,13 +515,13 @@ class LocalElasticAgentTest(unittest.TestCase):
         self.assertFalse(res.is_failed())
 
     def run_check_nccl_async_error_handling_env(self):
-        # make sure NCCL_ASYNC_ERROR_HANDLING set in os.environ is honored
-        with patch.dict(os.environ, {"NCCL_ASYNC_ERROR_HANDLING": "0"}):
+        # make sure TORCH_NCCL_ASYNC_ERROR_HANDLING set in os.environ is honored
+        with patch.dict(os.environ, {"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"}):
             res = self.run_agent(
                 Conf(
                     entrypoint=_check_env_value,
                     local_world_size=1,
-                    args=("NCCL_ASYNC_ERROR_HANDLING", "0"),
+                    args=("TORCH_NCCL_ASYNC_ERROR_HANDLING", "0"),
                 )
             )
             self.assertFalse(res.is_failed())
@@ -510,7 +532,7 @@ class LocalElasticAgentTest(unittest.TestCase):
             Conf(
                 entrypoint=_check_env_value,
                 local_world_size=1,
-                args=("NCCL_ASYNC_ERROR_HANDLING", "1"),
+                args=("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
             )
         )
         self.assertFalse(res.is_failed())
@@ -623,16 +645,16 @@ class LocalElasticAgentTest(unittest.TestCase):
     def test_simple_dist_sum_etcd_v2(self):
         self.run_test_with_backend(backend="etcd-v2", test_to_run=self.simple_dist_sum)
 
-    def run_distributed_sum_homogeneous(self):
+    def run_distributed_sum_homogeneous(self, log_line_prefix_template: Optional[str] = None):
         node_configs = [
-            Conf(role="sum", entrypoint=_dist_sum, local_world_size=4),
-            Conf(role="sum", entrypoint=_dist_sum, local_world_size=4),
+            Conf(role="sum", entrypoint=_dist_sum, local_world_size=4, tee=Std.ALL),
+            Conf(role="sum", entrypoint=_dist_sum, local_world_size=4, tee=Std.ALL),
         ]
         # When the process method is spawn, the coverage collector hangs
         # due to getting stuck on the _dist_sum in waiting for TCPStore workers
         # to join the cluster
         # TODO(aivanou): t83447589 come up with the proper fix
-        res = self.run_job(node_configs)
+        res = self.run_job(node_configs, log_line_prefix_template=log_line_prefix_template)
         self.assertEqual(2, len(res["sum"]))
         ranks = set()
         for run_results in res["sum"]:
@@ -648,6 +670,14 @@ class LocalElasticAgentTest(unittest.TestCase):
         self.run_test_with_backend(
             backend="c10d", test_to_run=self.run_distributed_sum_homogeneous
         )
+
+    def test_run_with_custom_log_lines(self):
+        log_line_prefix_template = "[${role_name}-${local_rank}:${rank}]:"
+        self.run_test_with_backend(
+            backend="c10d",
+            test_to_run=lambda: self.run_distributed_sum_homogeneous(log_line_prefix_template)
+        )
+
 
     @unittest.skipIf(
         TEST_WITH_DEV_DBG_ASAN or TEST_WITH_TSAN,
@@ -717,7 +747,7 @@ class LocalElasticAgentTest(unittest.TestCase):
 
             rank, failure = cm.exception.get_first_failure()
             failure_data = failure.error_file_data["message"]
-            with open(replyfile, "r") as fp:
+            with open(replyfile) as fp:
                 data = json.load(fp)["message"]
 
                 # ran two; both failed; first failure is either rank 0 or 1
@@ -870,8 +900,8 @@ class LocalElasticAgentTest(unittest.TestCase):
 
         # global world size == sum of all the role world sizes
         expected_world_size = sum(expected_role_world_sizes.values())
-        for role, run_results in run_results.items():
-            for result in run_results:
+        for role, results in run_results.items():
+            for result in results:
                 res = result.return_values
                 for role_info in res.values():
                     rank = role_info.rank
@@ -961,6 +991,63 @@ class LocalElasticAgentTest(unittest.TestCase):
     def test_double_agent_fault_tolerance_etcd_v2(self):
         self.run_test_with_backend(
             backend="etcd-v2", test_to_run=self.double_agent_fault_tolerance
+        )
+
+    def no_exit_barrier_on_failure(self):
+        """
+        start ``nnodes`` agents, kill and restart odd ones, validate fault-tolerance works
+        """
+        nnodes = 2
+        wait = 20
+        node_conf = Conf(
+            entrypoint=_bipolar_sleep_function, args=(wait,), local_world_size=2
+        )
+        agent_results = mp.Queue()
+        monitor_interval_s = 0.5
+        agent_args = {
+            "conf": node_conf,
+            "agent_results": agent_results,
+            "min_nodes": nnodes,
+            "max_nodes": nnodes,
+            "max_restarts": 0,
+            "exit_barrier_timeout": 300,
+            "monitor_interval": monitor_interval_s,
+        }
+
+        procs = []
+        for _ in range(nnodes):
+            p = mp.Process(
+                target=self.run_agent,
+                kwargs=agent_args,
+            )
+            procs.append(p)
+            p.start()
+
+        # wait for all processes to finish should not take exit barrier time
+        exit_interval_between_agents = 0
+        for i in range(nnodes):
+            p = procs[i]
+            p.join()
+            self.assertNotEqual(0, p.exitcode)
+            exit_interval_between_agents = (
+                time.monotonic() - exit_interval_between_agents
+            )
+
+        # Validate that the processes finish close to each other.
+        # Using a slightly higher timeout than 2 * monitor_interval (0.01) to make it less flaky
+        self.assertGreater(
+            2 * monitor_interval_s,
+            exit_interval_between_agents,
+            "Agents are not cleaned up until 2 * monitor_interval",
+        )
+
+    @unittest.skipIf(
+        TEST_WITH_DEV_DBG_ASAN or TEST_WITH_TSAN,
+        "test incompatible with dev/dbg asan or tsan",
+    )
+    def test_no_exit_barrier_on_failure(self):
+        self.run_test_with_backend(
+            backend="c10d", test_to_run=self.no_exit_barrier_on_failure
         )
 
     def double_agent_elastic(self):

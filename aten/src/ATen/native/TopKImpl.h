@@ -2,8 +2,7 @@
 #include <ATen/core/TensorAccessor.h>
 #include <ATen/NumericUtils.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 #ifdef CPU_CAPABILITY
 inline namespace CPU_CAPABILITY {
@@ -23,6 +22,11 @@ void topk_impl_loop(
     const bool sorted,
     char** data, const int64_t* strides, const int64_t n) {
 
+  // If k is zero, then output values and indices are empty tensors
+  // So iterating over other dims is pointless
+  if (k == 0) {
+    return;
+  }
   using elem_t = std::pair<accscalar_t, int64_t>;
   std::vector<elem_t> queue(dim_size);
   for (const auto i : c10::irange(n)) {
@@ -36,10 +40,10 @@ void topk_impl_loop(
         reinterpret_cast<scalar_t*>(data[2] + i * strides[2]),
         &dim_size, &tmp_values_stride);
 
-    auto n = dim_size;
-    auto use_partial_sort = k * 64 <= n;
+    auto n_2 = dim_size;
+    auto use_partial_sort = k * 64 <= n_2;
 
-    for (const auto j : c10::irange(n)) {
+    for (const auto j : c10::irange(n_2)) {
       queue[j].first = tmp_values[j];
       queue[j].second = j;
     }
@@ -91,5 +95,4 @@ void topk_impl_loop(
 }
 
 } // namespace CPU_CAPABILITY
-} // namespace native
-} // namespace at
+} // namespace at::native

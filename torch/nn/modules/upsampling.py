@@ -130,6 +130,7 @@ class Upsample(Module):
                   [1.2000, 1.3600, 1.5200, 1.2800, 0.6400, 0.0000],
                   [0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000]]]])
     """
+
     __constants__ = ['size', 'scale_factor', 'mode', 'align_corners', 'name', 'recompute_scale_factor']
     name: str
     size: Optional[_size_any_t]
@@ -156,6 +157,12 @@ class Upsample(Module):
         return F.interpolate(input, self.size, self.scale_factor, self.mode, self.align_corners,
                              recompute_scale_factor=self.recompute_scale_factor)
 
+    def __setstate__(self, state):
+        if 'recompute_scale_factor' not in state:
+            state['recompute_scale_factor'] = True
+
+        super().__setstate__(state)
+
     def extra_repr(self) -> str:
         if self.scale_factor is not None:
             info = 'scale_factor=' + repr(self.scale_factor)
@@ -166,8 +173,7 @@ class Upsample(Module):
 
 
 class UpsamplingNearest2d(Upsample):
-    r"""Applies a 2D nearest neighbor upsampling to an input signal composed of several input
-    channels.
+    r"""Applies a 2D nearest neighbor upsampling to an input signal composed of several input channels.
 
     To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
     as it's constructor argument.
@@ -206,13 +212,13 @@ class UpsamplingNearest2d(Upsample):
                   [3., 3., 4., 4.],
                   [3., 3., 4., 4.]]]])
     """
+
     def __init__(self, size: Optional[_size_2_t] = None, scale_factor: Optional[_ratio_2_t] = None) -> None:
         super().__init__(size, scale_factor, mode='nearest')
 
 
 class UpsamplingBilinear2d(Upsample):
-    r"""Applies a 2D bilinear upsampling to an input signal composed of several input
-    channels.
+    r"""Applies a 2D bilinear upsampling to an input signal composed of several input channels.
 
     To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
     as it's constructor argument.
@@ -253,5 +259,6 @@ class UpsamplingBilinear2d(Upsample):
                   [2.3333, 2.6667, 3.0000, 3.3333],
                   [3.0000, 3.3333, 3.6667, 4.0000]]]])
     """
+
     def __init__(self, size: Optional[_size_2_t] = None, scale_factor: Optional[_ratio_2_t] = None) -> None:
         super().__init__(size, scale_factor, mode='bilinear', align_corners=True)

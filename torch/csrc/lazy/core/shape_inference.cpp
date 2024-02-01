@@ -62,11 +62,10 @@
 #include <ATen/native/ReduceOpsUtils.h>
 #include <ATen/native/TensorConversions.h>
 #include <c10/core/ScalarType.h>
-#include <torch/csrc/api/include/torch/enum.h>
+#include <torch/csrc/lazy/core/dynamic_ir.h>
 #include <torch/csrc/lazy/core/ops/utils.h>
 #include <torch/csrc/lazy/core/shape.h>
 #include <torch/csrc/lazy/core/util.h>
-#include <torch/csrc/lazy/ts_backend/dynamic_ir.h>
 #include <ostream>
 #include <vector>
 
@@ -75,7 +74,7 @@ namespace lazy {
 
 // Copied from ATen/native/utils/ParamUtils.h, which aparently I can't include
 // from here?
-std::vector<int64_t> expand_param_if_needed(
+static std::vector<int64_t> expand_param_if_needed(
     at::IntArrayRef list_param,
     const char* param_name,
     int64_t expected_dim) {
@@ -124,7 +123,7 @@ TORCH_API std::vector<Shape> compute_shape_arange_out(
         // because of precision issues, which we dont want. the corner-case we
         // do want to take into account is int64_t, which has higher precision
         // than double NOLINTNEXTLINE(bugprone-branch-clone)
-        if (std::is_same<scalar_t, int64_t>::value) {
+        if constexpr (std::is_same_v<scalar_t, int64_t>) {
           size_d = std::ceil(
               static_cast<double>(
                   end.to<accscalar_t>() - start.to<accscalar_t>()) /
@@ -160,7 +159,7 @@ TORCH_API std::vector<Shape> compute_shape_arange_out(
   // From torch.arange docs:
   // dtype (torch.dtype, optional) – the desired data type of returned tensor.
   // Default: if None, uses a global default (see
-  // torch.set_default_tensor_type()). If dtype is not given, infer the data
+  // torch.set_default_dtype()). If dtype is not given, infer the data
   // type from the other input arguments. If any of start, end, or stop are
   // floating-point, the dtype is inferred to be the default dtype, see
   // get_default_dtype(). Otherwise, the dtype is inferred to be torch.int64.
@@ -357,7 +356,9 @@ std::vector<Shape> compute_shape_min(const at::Tensor& self) {
   return {Shape(self.scalar_type(), {})};
 }
 
-std::vector<Shape> compute_shape_nonzero(const at::Tensor& t, bool as_tuple) {
+static std::vector<Shape> compute_shape_nonzero(
+    const at::Tensor& t,
+    bool as_tuple) {
   if (as_tuple) {
     auto res = std::vector<Shape>();
     for (auto dim_size : t.sizes()) {
@@ -451,25 +452,24 @@ std::vector<Shape> compute_shape_expand(
       padded_self.end(), self.sizes().begin(), self.sizes().end());
   std::vector<int64_t> target_size(_sizes.size());
   for (const auto idx : c10::irange(_sizes.size())) {
-    if (_sizes[idx].is_symbolic()) {
-      c10::SymNode symbolicIntNode = _sizes[idx].toSymNodeImpl();
-      auto* lazySymNode =
-          dynamic_cast<torch::lazy::SymNodeImpl*>(symbolicIntNode.get());
+    if (auto ma = _sizes[idx].maybe_as_int()) {
+      target_size[idx] = *ma;
+      if (*ma == -1) {
+        // -1 can't be specified for non-existing dimensions
+        TORCH_CHECK(idx >= num_new_dimensions);
+        target_size[idx] = padded_self[idx];
+      } else {
+        target_size[idx] = *ma;
+      }
+    } else {
+      auto* lazySymNode = dynamic_cast<torch::lazy::SymNodeImpl*>(
+          _sizes[idx].toSymNodeImplUnowned());
       TORCH_INTERNAL_ASSERT(lazySymNode);
       auto size_node = lazySymNode->node_;
       auto static_value =
           std::dynamic_pointer_cast<torch::lazy::DimensionNode>(size_node)
               ->getStaticValue();
       target_size[idx] = static_value;
-    } else {
-      target_size[idx] = _sizes[idx].as_int_unchecked();
-      if (_sizes[idx].as_int_unchecked() == -1) {
-        // -1 can't be specified for non-existing dimensions
-        TORCH_CHECK(idx >= num_new_dimensions);
-        target_size[idx] = padded_self[idx];
-      } else {
-        target_size[idx] = _sizes[idx].as_int_unchecked();
-      }
     }
   }
   return {Shape(self.scalar_type(), target_size)};
@@ -515,7 +515,8 @@ std::vector<Shape> compute_shape_cat(at::TensorList tensors, int64_t dim) {
   }
   TORCH_CHECK(!out_shape.empty(), "Scalar tensors are not supported in cat.");
   TORCH_CHECK(
-      extended_dim_shape <= std::numeric_limits<int64_t>::max(),
+      extended_dim_shape <=
+          static_cast<size_t>(std::numeric_limits<int64_t>::max()),
       "Size overflow");
   out_shape[dim] = extended_dim_shape;
   return {Shape(tensors[0].scalar_type(), out_shape)};
@@ -642,7 +643,7 @@ std::vector<Shape> compute_shape_native_layer_norm_backward(
       output_mask[1] && weight ? weight->sizes().vec()
                                : std::vector<int64_t>{});
   shapes.emplace_back(
-      bias && weight->defined() ? bias->scalar_type() : input.scalar_type(),
+      bias && bias->defined() ? bias->scalar_type() : input.scalar_type(),
       output_mask[2] && bias ? bias->sizes().vec() : std::vector<int64_t>{});
   return shapes;
 }
@@ -714,12 +715,6 @@ std::vector<Shape> compute_shape_relu(const at::Tensor& self) {
   return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
-std::vector<Shape> compute_shape_bitwise_and(
-    const at::Tensor& self,
-    const at::Scalar& other) {
-  return {Shape(self.scalar_type(), self.sizes().vec())};
-}
-
 std::vector<Shape> compute_shape_sum(
     const at::Tensor& self,
     c10::optional<at::ScalarType> dtype) {
@@ -756,21 +751,6 @@ std::vector<Shape> compute_shape_sort(
   return {
       Shape(self.scalar_type(), self.sizes().vec()),
       Shape(c10::ScalarType::Long, self.sizes().vec())};
-}
-
-std::vector<Shape> compute_shape_smooth_l1_loss(
-    const at::Tensor& self,
-    const at::Tensor& target,
-    int64_t reduction,
-    double beta) {
-  // Taken from definition of 'Output' shape here:
-  // https://pytorch.org/docs/stable/generated/torch.nn.SmoothL1Loss.html
-  switch (reduction) {
-    case at::Reduction::None:
-      return {Shape(self.scalar_type(), self.sizes().vec())};
-    default:
-      return {Shape(self.scalar_type(), {})};
-  }
 }
 
 std::vector<Shape> compute_shape_slogdet(const at::Tensor& self) {
@@ -1023,7 +1003,7 @@ std::vector<Shape> compute_shape__adaptive_avg_pool3d(
       "adaptive_avg_pool3d(): Expected 4D or 5D tensor, but got ",
       self.sizes());
 
-  int64_t channels = self.size(-3);
+  int64_t channels = self.size(-4);
   int64_t output_depth = output_size[0];
   int64_t output_height = output_size[1];
   int64_t output_width = output_size[2];
@@ -1386,6 +1366,22 @@ std::vector<Shape> compute_shape_as_strided_scatter_symint(
       at::compositeexplicitautogradnonfunctional::as_strided_scatter_symint(
           self_meta, src_meta, size, stride, storage_offset);
   return {Shape(out_meta.scalar_type(), out_meta.sizes().vec())};
+}
+
+std::vector<Shape> compute_shape_normal_functional(
+    const at::Tensor& self,
+    double mean,
+    double std,
+    c10::optional<at::Generator> generator) {
+  return {Shape(self.scalar_type(), self.sizes().vec())};
+}
+
+std::vector<Shape> compute_shape_uniform(
+    const at::Tensor& self,
+    double from,
+    double to,
+    c10::optional<at::Generator> generator) {
+  return {Shape(self.scalar_type(), self.sizes().vec())};
 }
 
 // Restore unused-parameters warnings

@@ -1,249 +1,432 @@
-import contextlib
 import copy
-from typing import Callable, Tuple, Generator, Dict, Optional
-from unittest.mock import patch
 import dataclasses
-
-import torch
+import functools
+import io
+import json
+import os
+import re
+import sys
+import types
+import warnings
 import weakref
-import torch._dynamo as torchdynamo
-from torch._decomp import core_aten_decompositions
-from torch._dispatch.python import enable_python_dispatcher
-from torch.nn.utils import stateless
-from torch.utils import _pytree as pytree
-from torch.fx.experimental.symbolic_shapes import StrictMinMaxConstraint
-from torch.utils._sympy.value_ranges import ValueRanges
+import zipfile
+from collections import OrderedDict
+from contextlib import contextmanager
+
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from unittest.mock import patch
+
 import sympy
 
-from torch._functorch.aot_autograd import (
-    AOTConfig,
-    create_aot_dispatcher_function,
-    default_partition,
-    run_functionalized_fw_and_collect_metadata,
+import torch
+import torch._dynamo
+import torch.fx
+import torch.utils._pytree as pytree
+
+from torch._decomp import core_aten_decompositions, get_decompositions
+from torch._dispatch.python import enable_python_dispatcher
+from torch._dynamo.exc import UserError, UserErrorType
+from torch._dynamo.source import ConstantSource
+from torch._export.passes.collect_tracepoints_pass import CollectTracepointsPass
+from torch._functorch.aot_autograd import aot_export_module, GraphSignature
+from torch._functorch.eager_transforms import functionalize
+from torch._guards import detect_fake_mode
+from torch._ops import OpOverload
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch._subclasses.functional_tensor import FunctionalTensor
+from torch.export._tree_utils import reorder_kwargs
+from torch.export.exported_program import (
+    ExportedProgram,
+    ModuleCallEntry,
+    ModuleCallSignature,
+    _disable_prexisiting_fake_mode,
 )
-
-from torch.fx.experimental.proxy_tensor import (
-    get_proxy_slot,
-    get_torch_dispatch_modes,
-    has_proxy_slot,
-    make_fx,
-    ProxyTorchDispatchMode,
-    set_proxy_slot,
+from torch.export.graph_signature import (
+    _sig_to_specs,
+    ArgumentSpec,
+    ConstantArgument,
+    ExportGraphSignature,
+    InputKind,
+    InputSpec,
+    OutputKind,
+    OutputSpec,
+    SymIntArgument,
+    TensorArgument,
 )
+from torch.export.dynamic_shapes import (
+    Constraint,
+    dims,
+    dynamic_dim,
+    _process_constraints,
+    _process_dynamic_shapes,
+)
+from torch.export._unlift import _create_stateful_graph_module
+from torch.fx import traceback as fx_traceback
+from torch.fx._compatibility import compatibility
+from torch.fx.experimental.proxy_tensor import make_fx, maybe_disable_fake_tensor_mode
+from torch.fx.experimental.symbolic_shapes import (
+    ConstraintViolationError,
+    GuardOnDataDependentSymNode,
+    ShapeEnv,
+    StrictMinMaxConstraint,
+)
+from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
+from torch.utils._sympy.value_ranges import ValueRangeError, ValueRanges
 
-from torch._functorch.eager_transforms import _unwrap_all_tensors_from_functional
+from .exported_program import (
+    CallSpec,
+)
+from .passes.add_runtime_assertions_for_constraints_pass import (
+    _AddRuntimeAssertionsForInlineConstraintsPass,
+)
+from .wrappers import _wrap_submodules
+from torch._inductor import config
 
-from .workflow import ExportedProgram
 
-CORE_ATEN_DECOMPOSITIONS_TABLE = core_aten_decompositions()
-
-__all__ = ["experimental_export"]
-
-
-def _aot_capture(mod, flat_args):
+@dataclasses.dataclass
+class ExportDynamoConfig:
     """
-    A wrapper around aot_autograd() to mix AOT Autograd + torch.export.
-    Some assumptions were made about the AOT Autograd internal:
-    1. The functionalization metadata format.
-    2. Calling convention of returned forward graph.
-    3. make_fx() internal proxy storage.
-
-    In the current context we're just experimenting the idea so it's possible things
-    could break. For the next step we should find a way to upstream something reasonable.
+    Manage Export-specific configurations of Dynamo.
     """
-    param_list = [
-        *mod.named_parameters(remove_duplicate=False),
-        *mod.named_buffers(remove_duplicate=False),
-    ]
-    params = dict(param_list)
-    params_flat, params_spec = pytree.tree_flatten(params)
-    params_len = len(params_flat)
+    allow_rnn: bool = True
 
-    full_args = []
-    full_args.extend(params_flat)
-    full_args.extend(flat_args)
 
-    def functional_call(*args):
+@compatibility(is_backward_compatible=False)
+def capture_pre_autograd_graph(
+    f: Callable,
+    args: Tuple[Any],
+    kwargs: Optional[Dict[str, Any]] = None,
+    constraints: Optional[List[Constraint]] = None,
+    dynamic_shapes: Optional[Union[Dict[str, Any], Tuple[Any]]] = None,
+) -> torch.nn.Module:
+    """
+    A helper function that is intended to trace a module before any pre-autograd
+    decomposition is run. The produced module will be "non-functional" and
+    composed of aten operators. Later this API will be deleted in favor of more general
+    torch.export API.
 
-        with stateless._reparametrize_module(
-            mod,
-            pytree.tree_unflatten(args[:params_len], params_spec),  # type: ignore[arg-type]
-        ):
-            return torch.fx.Interpreter(mod).run(*args[params_len:])
+    Args:
+      f: A callable to be traced
 
-    out_spec = None
+      args: example positional inputs.
 
-    with enable_python_dispatcher():
-        fw_metadata = run_functionalized_fw_and_collect_metadata(
-            lambda *args: pytree.tree_flatten(functional_call(*args))[0],
-            keep_input_mutations=False,
-        )(*copy.deepcopy(full_args))  # type: ignore[operator]
+      kwargs: optional example keyword inputs.
 
-    assert len(fw_metadata.input_info) == len(full_args)
-    mutated_input_indices = [
-        i
-        for i, input_info in enumerate(fw_metadata.input_info)
-        if input_info.mutates_data or input_info.mutates_metadata
-    ]
+      constraints: [DEPRECATED: use ``dynamic_shapes`` instead, see below]
+         An optional list of constraints on the dynamic arguments
+         that specify their possible range of shapes. By default, shapes of
+         input torch.Tensors are assumed to be static. If an input torch.Tensor
+         is expected to have dynamic shapes, please use :func:`dynamic_dim`
+         to define :class:`Constraint` objects that specify the dynamics and the possible
+         range of shapes. See :func:`dynamic_dim` docstring for examples on
+         how to use it.
 
-    graph_module = None
+      dynamic_shapes: Should either be:
+         1) a dict from argument names of ``f`` to their dynamic shape specifications,
+         2) a tuple that specifies dynamic shape specifications for each input in original order.
+         If you are specifying dynamism on keyword args, you will need to pass them in the order that
+         is defined in the original function signature.
 
-    def fw_compiler(gm, inputs):
-        nonlocal graph_module
-        graph_module = gm
+         The dynamic shape of a tensor argument can be specified as either
+         (1) a dict from dynamic dimension indices to :func:`Dim` types, where it is
+         not required to include static dimension indices in this dict, but when they are,
+         they should be mapped to None; or (2) a tuple / list of :func:`Dim` types or None,
+         where the :func:`Dim` types correspond to dynamic dimensions, and static dimensions
+         are denoted by None. Arguments that are dicts or tuples / lists of tensors are
+         recursively specified by using mappings or sequences of contained specifications.
 
-    num_fwd_returns = None
+    Returns:
+        An nn.Module containing the traced method.
 
-    def partition_fn(joint_module, joint_inputs, *, num_fwd_outputs, **kwargs):
-        nonlocal num_fwd_returns
-        num_fwd_returns = num_fwd_outputs
-        return default_partition(
-            joint_module, joint_inputs, num_fwd_outputs=num_fwd_outputs, **kwargs
+    """
+    from torch.export._trace import _convert_input_to_fake, DEFAULT_EXPORT_DYNAMO_CONFIG
+    from torch.export.dynamic_shapes import _process_dynamic_shapes
+
+    if kwargs is None:
+        kwargs = {}
+
+    if constraints is not None:
+        warnings.warn(
+            "Using `constraints` to specify dynamic shapes for export is DEPRECATED "
+            "and will not be supported in the future. "
+            "Please use `dynamic_shapes` instead (see docs on `torch.export.export`).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    else:
+        constraints = _process_dynamic_shapes(f, args, kwargs, dynamic_shapes)
+
+    decomp_table = {op: op.decompose for op in FunctionalTensor.maybe_aliasing_or_mutating_ops}
+    with torch._dynamo.config.patch(dataclasses.asdict(DEFAULT_EXPORT_DYNAMO_CONFIG)):
+        m = torch._dynamo.export(
+            f,
+            constraints=constraints,
+            assume_static_by_default=True,
+            tracing_mode="symbolic",
+            decomposition_table=decomp_table,
+            pre_dispatch=True,
+            aten_graph=True,
+        )(
+            *args,
+            **kwargs,
+        )[0]
+
+        _, _, _, fake_mode = _convert_input_to_fake(m, args, kwargs)
+
+        m.meta["inline_constraints"] = {
+            k: v
+            for k, v in fake_mode.shape_env.runtime_var_to_range.items()
+            if re.match(r"^[if]\d+$", str(k))
+        }
+
+        if isinstance(f, torch.nn.Module):
+            from torch.export._trace import _restore_state_dict
+            _restore_state_dict(f, m)
+
+        flat_args, _ = pytree.tree_flatten((args, kwargs or {}))
+        range_constraints = _process_constraints(m, 0, flat_args)
+        module = _create_stateful_graph_module(
+            m,
+            range_constraints=range_constraints,
         )
 
-    def set_state_proxies(state_args):
-        modes = get_torch_dispatch_modes()
-        proxy_tensor_modes = [m for m in modes if isinstance(m, ProxyTorchDispatchMode)]
-        if len(proxy_tensor_modes) == 0:
-            return
-        assert len(state_args) == len(params_flat)
-        for i, arg in enumerate(state_args):
-            tracer = next(
-                m.tracer for m in proxy_tensor_modes if has_proxy_slot(arg, m.tracer)
+    def _train(self, mode: bool = True):
+        raise NotImplementedError("Calling train() is not supported yet.")
+
+    def _eval(self, mode: bool = True):
+        raise NotImplementedError("Calling eval() is not supported yet.")
+
+    module.train = types.MethodType(_train, module)  # type: ignore[method-assign]
+    module.eval = types.MethodType(_eval, module)  # type: ignore[method-assign]
+    return module
+
+
+def export(
+    f: Callable,
+    args: Tuple[Any, ...],
+    kwargs: Optional[Dict[str, Any]] = None,
+    constraints: Optional[List[Constraint]] = None,
+    *,
+    strict: bool = True,
+    preserve_module_call_signature: Tuple[str, ...] = (),
+) -> ExportedProgram:
+    from torch.export._trace import _export
+    warnings.warn("This function is deprecated. Please use torch.export.export instead.")
+
+    if constraints is not None:
+        warnings.warn(
+            "Using `constraints` to specify dynamic shapes for export is DEPRECATED "
+            "and will not be supported in the future. "
+            "Please use `dynamic_shapes` instead (see docs on `torch.export.export`).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return _export(
+        f,
+        args,
+        kwargs,
+        constraints,
+        strict=strict,
+        preserve_module_call_signature=preserve_module_call_signature,
+    )
+
+
+def save(
+    ep: ExportedProgram,
+    f: Union[str, os.PathLike, io.BytesIO],
+    *,
+    extra_files: Optional[Dict[str, Any]] = None,
+    opset_version: Optional[Dict[str, int]] = None,
+) -> None:
+    if not isinstance(ep, ExportedProgram):
+        raise TypeError(f"save() expects an ExportedProgram but got {type(ep)}")
+
+    from .serde.serialize import serialize, SerializedArtifact
+    from .serde.schema import SCHEMA_VERSION
+    artifact: SerializedArtifact = serialize(ep, opset_version)
+
+    if isinstance(f, (str, os.PathLike)):
+        f = os.fspath(f)
+
+    with zipfile.ZipFile(f, 'w') as zipf:
+        # Save every field the SerializedArtifact to a file
+        assert isinstance(artifact.exported_program, bytes)
+        zipf.writestr("serialized_exported_program.json", artifact.exported_program)
+        zipf.writestr("serialized_state_dict.pt", artifact.state_dict)
+        zipf.writestr("serialized_constants.pt", artifact.constants)
+
+        zipf.writestr('version', ".".join(map(str, SCHEMA_VERSION)))
+
+        # Add extra files if provided
+        if extra_files:
+            for extra_file_name, content in extra_files.items():
+                encoded_content = content.encode('utf-8')
+                zipf.writestr(f"extra_files/{extra_file_name}", encoded_content)
+
+
+def load(
+    f: Union[str, os.PathLike, io.BytesIO],
+    *,
+    extra_files: Optional[Dict[str, Any]] = None,
+    expected_opset_version: Optional[Dict[str, int]] = None,
+) -> ExportedProgram:
+    if isinstance(f, (str, os.PathLike)):
+        f = os.fspath(f)
+
+    extra_files = extra_files or {}
+
+    with zipfile.ZipFile(f, 'r') as zipf:
+        # Check the version
+        version = zipf.read('version').decode().split('.')
+        from .serde.schema import SCHEMA_VERSION
+
+        assert len(version) == len(SCHEMA_VERSION)
+        if version[0] != str(SCHEMA_VERSION[0]):
+            raise RuntimeError(
+                f"Serialized version {version} does not match our current "
+                f"schema version {SCHEMA_VERSION}."
             )
-            set_proxy_slot(arg, tracer, params_flat[i])
 
-    aot_config = AOTConfig(
-        fw_compiler=fw_compiler,
-        bw_compiler=lambda gm, inputs: None,
-        partition_fn=partition_fn,
-        decompositions=CORE_ATEN_DECOMPOSITIONS_TABLE,  # type: ignore[arg-type]
-        num_params_buffers=params_len,
-        aot_id=-1,
-        keep_inference_input_mutations=False,
-        dynamic_shapes=True,
-    )
+        from .serde.serialize import deserialize, SerializedArtifact
 
-    def exported_call(*args):
-        state_args = args[:params_len]
-        unwrapped_state_args = _unwrap_all_tensors_from_functional(
-            state_args, reapply_views=False
+        # Load serialized_ep and serialized_state_dict from the zip file
+
+        serialized_exported_program: Optional[bytes] = None
+        serialized_state_dict: Optional[bytes] = None
+        serialized_constants: Optional[bytes] = None
+
+        for file_info in zipf.infolist():
+            file_content = zipf.read(file_info.filename)
+
+            if file_info.filename == "serialized_exported_program.json":
+                serialized_exported_program = file_content
+            elif file_info.filename == "serialized_state_dict.json":
+                warnings.warn("This version of file is deprecated")
+                serialized_state_dict = file_content
+            elif file_info.filename == "serialized_constants.json":
+                warnings.warn("This version of file is deprecated")
+                serialized_constants = file_content
+            elif file_info.filename == "serialized_state_dict.pt":
+                serialized_state_dict = file_content
+            elif file_info.filename == "serialized_constants.pt":
+                serialized_constants = file_content
+            elif file_info.filename.startswith("extra_files"):
+                filename = file_info.filename.split("/", 1)[1]
+                extra_files[filename] = file_content.decode('utf-8')
+
+        assert serialized_exported_program is not None
+        assert serialized_state_dict is not None
+        assert serialized_constants is not None
+        artifact: SerializedArtifact = SerializedArtifact(
+            serialized_exported_program,
+            serialized_state_dict,
+            serialized_constants,
         )
-        set_state_proxies(unwrapped_state_args)
-        with torch.fx.traceback.preserve_node_meta():
-            outputs = functional_call(*args)
-        nonlocal out_spec
-        outputs, out_spec = pytree.tree_flatten(outputs)
-        return outputs
 
-    with torch.enable_grad():
-        create_aot_dispatcher_function(
-            exported_call,
-            full_args,
-            aot_config,
-        )
+        # Deserialize ExportedProgram
+        ep = deserialize(artifact, expected_opset_version)
 
-    assert graph_module is not None
-
-    for i, node in enumerate(graph_module.graph.nodes):
-        if i == len(params_flat):
-            break
-        assert node.op == "placeholder" and len(node.users) == 0
-        graph_module.graph.erase_node(node)
-
-    output_node = next(iter(reversed(graph_module.graph.nodes)))
-    assert output_node.op == "output" and len(output_node.args) == 1
-    assert num_fwd_returns is not None
-    # Turncate the output so we only output what we need.
-    output_node.args = (
-        output_node.args[0][
-            : len(mutated_input_indices) + len(fw_metadata.output_info)
-        ],
-    )
-
-    graph_module.graph.eliminate_dead_code()
-    graph_module.recompile()
-
-    def find_mutation_destinations(gm, w):
-        assert isinstance(w, torch.Tensor)
-        ret = [
-            name for name, x in [*gm.named_parameters(), *gm.named_buffers()] if x is w
-        ]
-        assert len(ret) != 0, "Cannot find mutation destination."
-        return ret
-
-    mutation = [
-        (
-            "copy_",
-            output_node.args[0][k].name,
-            find_mutation_destinations(graph_module, param_list[i][1]),
-        )
-        for k, i in enumerate(mutated_input_indices)
-    ]
-    assert out_spec is not None
-    return graph_module, mutation, out_spec
+        return ep
 
 
-@patch.object(torchdynamo.config, "dynamic_shapes", True)
-@patch.object(torchdynamo.config, "capture_scalar_outputs", True)
-@patch.object(torchdynamo.config, "guard_nn_modules", True)
-@patch.object(torchdynamo.config, "specialize_int", True)
-@patch.object(torchdynamo.config, "allow_rnn", True)
-@patch.object(torchdynamo.config, "verbose", True)
-def do_not_use_experimental_export(f: Callable, args: Tuple, training=False):
+def aot_compile(
+    f: Callable,
+    args: Tuple[Any],
+    kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    constraints: Optional[List[Constraint]] = None,
+    dynamic_shapes: Optional[Dict[str, Any]] = None,
+    options: Optional[Dict[str, Any]] = None,
+    remove_runtime_assertions: bool = False,
+    disable_constraint_solver: bool = False,
+) -> str:
     """
-    This prototype is under heavy development. Pls don't use it if you are
-    not part of PyTorch 2.0 Export team.
+    Note: this function is not stable yet
+
+    Traces either an nn.Module's forward function or just a callable with PyTorch
+    operations inside, generates executable cpp code from the program, and returns
+    the path to the generated shared library
+
+    Args:
+        f: the `nn.Module` or callable to trace.
+
+        args: example positional inputs.
+
+        kwargs: optional example keyword inputs.
+
+        constraints: A optional list of constraints on the dynamic arguments specifying
+            their possible range of their shapes
+
+        dynamic_shapes: An experimental new feature designed to subsume ``constraints``.
+            A dict mapping argument names of ``f`` to their dynamic shape
+            specifications, as follows. Dynamic shape specifications can be a
+            dict from dynamic dimensions to ``Dim`` types, or a tuple/list of
+            ``Optional[Dim]`` corresponding to each input dimension.
+
+        options: A dictionary of options to control inductor
+
+        disable_constraint_solver: Whether the dim constraint solver must be disabled.
+
+    Returns:
+        Path to the generated shared library
     """
-    if training:
-        NotImplementedError("training mode is not supported yet")
+    if constraints is not None:
+        warnings.warn(
+            "The constraints field is deprecated. "
+            "Please use dynamic_shapes instead."
+        )
 
-    flattened_args, in_spec = pytree.tree_flatten(args)
-    # Doing it twice so that if graph_module accidentally modifies the input
-    # we still get the same original input.
-    original_flat_args = tuple(flattened_args)
-    flat_args = tuple(flattened_args)
+    from torch.export._trace import _export_to_torch_ir
+    from torch._inductor.decomposition import select_decomp_table
 
-    graph_module, guards = torchdynamo.export(f, *args, aten_graph=False)
-    # TODO (tmanlaibaatar) do sth with guards?
-    graph_module, _, out_spec = _aot_capture(graph_module, flat_args)
-    return ExportedProgram(fw_module=graph_module, example_inputs=original_flat_args, in_spec=in_spec, out_spec=out_spec)
+    if constraints is None:
+        constraints = _process_dynamic_shapes(f, args, kwargs, dynamic_shapes)
 
+    if config.is_predispatch:
+        gm = torch.export._trace._export(f, args, kwargs, constraints, pre_dispatch=True).module()
+    else:
+        # We want to export to Torch IR here to utilize the pre_grad passes in
+        # inductor, which run on Torch IR.
+        gm = _export_to_torch_ir(
+            f,
+            args,
+            kwargs,
+            constraints,
+            disable_constraint_solver=disable_constraint_solver,
+            # Disabling this flag, because instead we can rely on the mapping
+            # dynamo_flat_name_to_original_fqn which is coming from Dynamo.
+            restore_fqn=False,
+        )
+    flat_example_inputs = pytree.arg_tree_leaves(*args, **(kwargs or {}))
 
+    with torch.no_grad():
+        so_path = torch._inductor.aot_compile(gm, flat_example_inputs, options)  # type: ignore[arg-type]
 
-# Note - [On Export Dynamic Dimension UX]
-#
-# After a lot of discussion, we have settled on a dynamic marking API
-# for export that meets the following constraints:
-# 1) Stateless
-# 2) Safe for numerous .export calls within a single process
-# 3) Simple to use
-# 4) Can be extended to constraints easily
-#
-# While the underlying API is still torch._dynamo.mark_dynamic, we offer a higher
-# level API that meets the constraints above.
-#
-# This API produces an object that is meant to be passed into torch._dynamo.export
-# constraints field. See docs on torch._dynamo.export for more details.
-#
-# Note - The output type and structure here is NOT BC and NOT A CONTRACT, we reserve
-# the right to change the output here at any time, and will do so as we extend the API.
-#
-# result = torch._dynamo.export(
-#     my_model,
-#     *sixtyfour_tensors,
-#     constraints=[
-#         # if you do only dynamic_dim, this is sugar for
-#         # -Inf <= dynamic_dim(blah, 0) <= Inf; we don’t otherwise
-#         # permit direct int->bool conversion
-#         dynamic_dim(blah, 0),
-#         # operator overloading because it makes it clear whether
-#         # or not you’re inclusive-exclusive range or not
-#         0 <= dynamic_dim(blah, 1) <= 100,
-#         # NB: But we actually truncate ranges to be >= 2, because of
-#         # 0/1 specialization
-#     ]
-# )
-def dynamic_dim(t: torch.Tensor, index: int):
-    from torch._dynamo.eval_frame import Constraint
-    return Constraint(weakref.ref(t), id(t), index, StrictMinMaxConstraint(ValueRanges(lower=2, upper=sympy.oo)))
+    return so_path
+
+def aot_load(so_path: str, device: str) -> Callable:
+    """
+    Loads a shared library generated by aot_compile and returns a callable
+
+    Args:
+        so_path: Path to the shared library
+
+    Returns:
+        A callable
+    """
+    if device == "cpu":
+        runner = torch._C._aoti.AOTIModelContainerRunnerCpu(so_path, 1)  # type: ignore[call-arg]
+    elif device == "cuda" or device.startswith("cuda:"):
+        runner = torch._C._aoti.AOTIModelContainerRunnerCuda(so_path, 1, device)  # type: ignore[assignment, call-arg]
+    else:
+        raise RuntimeError("Unsupported device " + device)
+
+    def optimized(*args, **kwargs):
+        call_spec = runner.get_call_spec()  # type: ignore[attr-defined]
+        in_spec = pytree.treespec_loads(call_spec[0])
+        out_spec = pytree.treespec_loads(call_spec[1])
+        flat_inputs = pytree.tree_flatten((args, reorder_kwargs(kwargs, in_spec)))[0]
+        flat_outputs = runner.run(flat_inputs)  # type: ignore[attr-defined]
+        return pytree.tree_unflatten(flat_outputs, out_spec)
+
+    return optimized

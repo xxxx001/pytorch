@@ -3,6 +3,7 @@
 #include <torch/csrc/profiler/unwind/action.h>
 #include <torch/csrc/profiler/unwind/lexer.h>
 #include <array>
+#include <iostream>
 #include <sstream>
 #include <vector>
 
@@ -202,7 +203,9 @@ struct FDE {
   }
 
   TableState readUpTo(uint64_t addr) {
-    TORCH_INTERNAL_ASSERT(low_pc_ <= addr && addr <= high_pc_, "NOT IN RANGE?");
+    if (addr < low_pc_ || addr > high_pc_) {
+      throw UnwindError("Address not in range");
+    }
     if (LOG) {
       (*out_) << "readUpTo " << (void*)addr << " for " << library_name_
               << " at " << (void*)load_bias_ << "\n";

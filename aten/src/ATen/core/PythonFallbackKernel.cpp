@@ -31,6 +31,7 @@ constexpr c10::DispatchKeySet after_Python_keyset = c10::DispatchKeySet(c10::Dis
 // This guard assumes that tls_on_entry has a value.
 struct StashTLSOnEntryGuard {
 public:
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   StashTLSOnEntryGuard(): saved_(tls_on_entry.value()) {
     tls_on_entry = c10::nullopt;
   }
@@ -107,6 +108,15 @@ void pythonTLSSnapshotFallback(const c10::OperatorHandle &op, c10::DispatchKeySe
   op.redispatchBoxed(dispatch_keys & c10::DispatchKeySet(c10::DispatchKeySet::FULL_AFTER, c10::DispatchKey::PythonTLSSnapshot), stack);
 }
 
+// The PreDispatch key gets a no-op fallback that just redispatches.
+// The main way this key is used is that we can register a mode to it from python (e.g. TorchProxyDispatchMode, for pre_dispatch tracing)
+// Can't this be a fallthrough kernel, instead of a fallback that just no-ops and redispatches?
+// Unfortunately, no: we need a real kernel that is not a fallthrough, in order for the PythonDispatcher to interpose on it.
+// Alternatively, we could have hardcoded this kernel (in C++) to directly call in TorchProxyDispatchMode.
+// Doing that in C++ is a pain though, so it's done in python using the PythonDispatcher for convenience.
+void preDispatchFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack) {
+  op.redispatchBoxed(dispatch_keys & c10::DispatchKeySet(c10::DispatchKeySet::FULL_AFTER, c10::DispatchKey::PreDispatch), stack);
+}
 
 } // anonymous namespace
 
@@ -151,4 +161,8 @@ TORCH_LIBRARY_IMPL(_, PythonDispatcher, m) {
 
 TORCH_LIBRARY_IMPL(_, PythonTLSSnapshot, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&pythonTLSSnapshotFallback>());
+}
+
+TORCH_LIBRARY_IMPL(_, PreDispatch, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&preDispatchFallback>());
 }

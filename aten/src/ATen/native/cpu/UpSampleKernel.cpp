@@ -73,30 +73,30 @@ using scale_t = std::vector<c10::optional<double>>;
 // - recursively compute interpolated output for each dimension
 // - we rely a lot on compiler's code optimization such that implemented operations
 //   can be automatically factorized and vectorized using SSE and AVX2
-template <int n, typename scalar_t, typename index_t, int interp_size>
+template <int n, typename scalar_t, typename opmath_t, typename index_t, int interp_size>
 struct Interpolate {
-    static inline scalar_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
+    static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
       index_t ids = *(index_t*)&data[0][i * strides[0]];
-      scalar_t wts = *(scalar_t*)&data[1][i * strides[1]];
-      scalar_t t = Interpolate<n - 1, scalar_t, index_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
-      scalar_t output = t * wts;
+      opmath_t wts = *(scalar_t*)&data[1][i * strides[1]];
+      opmath_t t = Interpolate<n - 1, scalar_t, opmath_t, index_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
+      opmath_t output = t * wts;
       for (const auto j : c10::irange(1, interp_size)) {
         ids = *(index_t*)&data[2 * j + 0][i * strides[2 * j + 0]];
         wts = *(scalar_t*)&data[2 * j + 1][i * strides[2 * j + 1]];
-        t = Interpolate<n - 1, scalar_t, index_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
+        t = Interpolate<n - 1, scalar_t, opmath_t, index_t, interp_size>::eval(src + ids, &data[2 * interp_size], &strides[2 * interp_size], i);
         output += t * wts;
       }
       return output;
   }
 };
 
-template <typename scalar_t, typename index_t, int interp_size>
-struct Interpolate<1, scalar_t, index_t, interp_size> {
-    static inline scalar_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
+template <typename scalar_t, typename opmath_t, typename index_t, int interp_size>
+struct Interpolate<1, scalar_t, opmath_t, index_t, interp_size> {
+    static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
       index_t ids = *(index_t*)&data[0][i * strides[0]];
-      scalar_t wts = *(scalar_t*)&data[1][i * strides[1]];
-      scalar_t t = *(scalar_t *)&src[ids];
-      scalar_t output = t * wts;
+      opmath_t wts = *(scalar_t*)&data[1][i * strides[1]];
+      opmath_t t = *(scalar_t *)&src[ids];
+      opmath_t output = t * wts;
       for (const auto j : c10::irange(1, interp_size)) {
         ids = *(index_t*)&data[2 * j + 0][i * strides[2 * j + 0]];
         wts = *(scalar_t*)&data[2 * j + 1][i * strides[2 * j + 1]];
@@ -107,17 +107,17 @@ struct Interpolate<1, scalar_t, index_t, interp_size> {
     }
 };
 
-template <int n, typename scalar_t, typename index_t>
-struct Interpolate<n, scalar_t, index_t, 1> {
-    static inline scalar_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
+template <int n, typename scalar_t, typename opmath_t, typename index_t>
+struct Interpolate<n, scalar_t, opmath_t, index_t, 1> {
+    static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
       index_t ids = *(index_t*)&data[0][i * strides[0]];
-      return Interpolate<n - 1, scalar_t, index_t, 1>::eval(src + ids, &data[2], &strides[2], i);
+      return Interpolate<n - 1, scalar_t, opmath_t, index_t, 1>::eval(src + ids, &data[2], &strides[2], i);
   }
 };
 
-template <typename scalar_t, typename index_t>
-struct Interpolate<1, scalar_t, index_t, 1> {
-    static inline scalar_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
+template <typename scalar_t, typename opmath_t, typename index_t>
+struct Interpolate<1, scalar_t, opmath_t, index_t, 1> {
+    static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
       index_t ids = *(index_t*)&data[0][i * strides[0]];
       return *(scalar_t *)&src[ids];
     }
@@ -128,37 +128,38 @@ struct Interpolate<1, scalar_t, index_t, 1> {
 // Once the issue is fixed we can keep generic implementation and remove:
 // struct Interpolate<n, scalar_t, index_t, 2> and
 // struct Interpolate<1, scalar_t, index_t, 2>
-template <int n, typename scalar_t, typename index_t>
-struct Interpolate<n, scalar_t, index_t, 2> {
-    static inline scalar_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
+template <int n, typename scalar_t, typename opmath_t, typename index_t>
+struct Interpolate<n, scalar_t, opmath_t, index_t, 2> {
+    static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
         index_t i0 = *(index_t*)&data[0][i * strides[0]];
         index_t i1 = *(index_t*)&data[2][i * strides[2]];
-        scalar_t w0 = *(scalar_t *)&data[1][i * strides[1]];
-        scalar_t w1 = *(scalar_t *)&data[3][i * strides[3]];
+        opmath_t w0 = *(scalar_t *)&data[1][i * strides[1]];
+        opmath_t w1 = *(scalar_t *)&data[3][i * strides[3]];
 
-        scalar_t t0 = Interpolate<n - 1, scalar_t, index_t, 2>::eval(src + i0, &data[4], &strides[4], i);
-        scalar_t t1 = Interpolate<n - 1, scalar_t, index_t, 2>::eval(src + i1, &data[4], &strides[4], i);
+        opmath_t t0 = Interpolate<n - 1, scalar_t, opmath_t, index_t, 2>::eval(src + i0, &data[4], &strides[4], i);
+        opmath_t t1 = Interpolate<n - 1, scalar_t, opmath_t, index_t, 2>::eval(src + i1, &data[4], &strides[4], i);
 
         return t0 * w0 + t1 * w1;
   }
 };
 
-template <typename scalar_t, typename index_t>
-struct Interpolate<1, scalar_t, index_t, 2> {
-    static inline scalar_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
+template <typename scalar_t, typename opmath_t, typename index_t>
+struct Interpolate<1, scalar_t, opmath_t, index_t, 2> {
+    static inline opmath_t eval(char* src, char** data, const int64_t* strides, int64_t i) {
         index_t i0 = *(index_t*)&data[0][i * strides[0]];
         index_t i1 = *(index_t*)&data[2][i * strides[2]];
-        scalar_t w0 = *(scalar_t *)&data[1][i * strides[1]];
-        scalar_t w1 = *(scalar_t *)&data[3][i * strides[3]];
-        scalar_t t0 = *(scalar_t *)&src[i0];
-        scalar_t t1 = *(scalar_t *)&src[i1];
+        opmath_t w0 = *(scalar_t *)&data[1][i * strides[1]];
+        opmath_t w1 = *(scalar_t *)&data[3][i * strides[3]];
+        opmath_t t0 = *(scalar_t *)&src[i0];
+        opmath_t t1 = *(scalar_t *)&src[i1];
         return t0 * w0 + t1 * w1;
     }
 };
 
 template <int n, typename scalar_t, typename index_t, int interp_size>
 static inline scalar_t interpolate(char* src, char** data, const int64_t* strides, int64_t i) {
-  return Interpolate<n, scalar_t, index_t, interp_size>::eval(src, data, strides, i);
+  using opmath_t = at::opmath_type<scalar_t>;
+  return Interpolate<n, scalar_t, opmath_t, index_t, interp_size>::eval(src, data, strides, i);
 }
 
 template <typename scalar_t, typename index_t>
@@ -758,6 +759,10 @@ struct HelperInterpBase {
     xsize = std::min(
         static_cast<int64_t>(center + support + 0.5 + align_corners_delta), input_size) - xmin;
 
+    // There are rare cases when due to precision xsize can be larger than max_interp_size by one.
+    // We have to clip the value
+    xsize = std::clamp(xsize, static_cast<int64_t>(0), max_interp_size);
+
     int64_t j = 0;
     for (; j < xsize; j++) {
       scalar_t w = filter_fn((j + xmin - center + 0.5 - align_corners_delta) * invscale);
@@ -1004,9 +1009,10 @@ struct HelperInterpNearest : public HelperInterpBase {
     HelperInterpNearest::init_indices_weights(
       scalar_type, output, output_size, ndims, reshape_dim, HelperInterpNearest::interp_size);
 
-    AT_DISPATCH_FLOATING_TYPES_AND(
-      ScalarType::BFloat16, scalar_type, "compute_indices_weights_nearest", [&] {
-        scalar_t scale = area_pixel_compute_scale<scalar_t>(input_size, output_size, align_corners, opt_scale);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+      kBFloat16, kHalf, scalar_type, "compute_indices_weights_nearest", [&] {
+        using opmath_t = at::opmath_type<scalar_t>;
+        opmath_t scale = area_pixel_compute_scale<opmath_t>(input_size, output_size, align_corners, opt_scale);
 
         auto input_index_ptr = output[0].data_ptr<int64_t>();
         int64_t input_index;
@@ -1016,7 +1022,6 @@ struct HelperInterpNearest : public HelperInterpBase {
         // index_f32 = (output_index) * scale
         // input_index = floor(index_f32)
         // Same as OpenCV INTER_NEAREST
-        using opmath_t = at::opmath_type<scalar_t>;
         for (const auto i : c10::irange(output_size)) {
           const auto real_input_index =
               area_pixel_compute_source_index<opmath_t>(
@@ -1055,9 +1060,10 @@ struct HelperInterpNearestExact : public HelperInterpNearest {
     HelperInterpNearest::init_indices_weights(
       scalar_type, output, output_size, ndims, reshape_dim, HelperInterpNearest::interp_size);
 
-    AT_DISPATCH_FLOATING_TYPES(
-      scalar_type, "compute_indices_weights_nearest", [&] {
-        scalar_t scale = area_pixel_compute_scale<scalar_t>(input_size, output_size, align_corners, opt_scale);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+      kBFloat16, kHalf, scalar_type, "compute_indices_weights_nearest", [&] {
+        using opmath_t = at::opmath_type<scalar_t>;
+        opmath_t scale = area_pixel_compute_scale<opmath_t>(input_size, output_size, align_corners, opt_scale);
 
         auto input_index_ptr = output[0].data_ptr<int64_t>();
         int64_t input_index;
@@ -1067,7 +1073,6 @@ struct HelperInterpNearestExact : public HelperInterpNearest {
         // index_f32 = (output_index + 0.5) * scale - 0.5
         // input_index = round(index_f32)
         // Same as Pillow and Scikit-Image/Scipy ndi.zoom
-        using opmath_t = at::opmath_type<scalar_t>;
         for (const auto i : c10::irange(output_size)) {
           const auto real_input_index =
               area_pixel_compute_source_index<opmath_t>(
@@ -1104,9 +1109,10 @@ struct HelperInterpLinear : public HelperInterpBase {
     std::vector<Tensor> output;
     HelperInterpLinear::init_indices_weights(
       scalar_type, output, output_size, ndims, reshape_dim, HelperInterpLinear::interp_size);
-    AT_DISPATCH_FLOATING_TYPES_AND(
-      ScalarType::BFloat16, scalar_type, "compute_indices_weights_linear", [&] {
-        scalar_t scale = area_pixel_compute_scale<scalar_t>(input_size, output_size, align_corners, opt_scale);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+      kBFloat16, kHalf, scalar_type, "compute_indices_weights_linear", [&] {
+        using opmath_t = at::opmath_type<scalar_t>;
+        opmath_t scale = area_pixel_compute_scale<opmath_t>(input_size, output_size, align_corners, opt_scale);
 
         auto input_index0_ptr = output[0].data_ptr<int64_t>();
         auto lambda0_ptr = output[1].data_ptr<scalar_t>();
@@ -1115,7 +1121,7 @@ struct HelperInterpLinear : public HelperInterpBase {
 
         for (const auto i : c10::irange(output_size)) {
 
-          compute_source_index_and_lambda<scalar_t>(
+          compute_source_index_and_lambda<scalar_t, opmath_t>(
             input_index0_ptr[i], input_index1_ptr[i],
             lambda0_ptr[i], lambda1_ptr[i],
             scale, i, input_size, output_size, align_corners
@@ -1137,9 +1143,7 @@ struct HelperInterpLinear : public HelperInterpBase {
   // src/libImaging/Resample.c#L20-L29
   template<typename scalar_t>
   static inline scalar_t aa_filter(scalar_t x) {
-    if (x < 0.0) {
-      x = -x;
-    }
+    x = std::abs(x);
     if (x < 1.0) {
       return 1.0 - x;
     }
@@ -1154,7 +1158,8 @@ struct HelperInterpLinear : public HelperInterpBase {
     int64_t ndims,
     int64_t reshape_dim,
     bool align_corners,
-    const c10::optional<double> opt_scale
+    const c10::optional<double> opt_scale,
+    bool antialias
   ) {
 
     std::vector<Tensor> indices_weights;
@@ -1167,6 +1172,7 @@ struct HelperInterpLinear : public HelperInterpBase {
         auto interp_size = HelperInterpLinear::interp_size;
         int unused;
         scalar_t unused_2;
+        auto align_corners_delta = (align_corners && !antialias) ? 0.5 : 0.0;
 
         std::tie(indices_weights, unused, unused_2) = HelperInterpLinear::_compute_indices_weights_aa<scalar_t>(
             input_size,
@@ -1177,8 +1183,8 @@ struct HelperInterpLinear : public HelperInterpBase {
             scale,
             interp_size,
             &HelperInterpLinear::aa_filter<scalar_t>,
-            /*antialias=*/true,
-            /*align_corners_delta=*/0.0);
+            /*antialias=*/antialias,
+            /*align_corners_delta=*/align_corners_delta);
       }
     );
     return indices_weights;
@@ -1228,24 +1234,25 @@ struct HelperInterpCubic : public HelperInterpBase {
     HelperInterpCubic::init_indices_weights(
       scalar_type, output, output_size, ndims, reshape_dim, HelperInterpCubic::interp_size);
 
-    AT_DISPATCH_FLOATING_TYPES_AND(
-      ScalarType::BFloat16, scalar_type, "compute_indices_weights_cubic", [&] {
-        scalar_t scale = area_pixel_compute_scale<scalar_t>(input_size, output_size, align_corners, opt_scale);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+      kBFloat16, kHalf, scalar_type, "compute_indices_weights_cubic", [&] {
+        using opmath_t = at::opmath_type<scalar_t>;
+        opmath_t scale = area_pixel_compute_scale<opmath_t>(input_size, output_size, align_corners, opt_scale);
 
         int64_t input_index;
         int64_t zero = static_cast<int64_t>(0);
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
-        scalar_t coeffs[4];
+        opmath_t coeffs[4];
 
         int64_t * idx_ptr;
         scalar_t * wt_ptr;
-        using opmath_t = at::opmath_type<scalar_t>;
         for (const auto i : c10::irange(output_size)) {
           const auto real_input_index =
               area_pixel_compute_source_index<opmath_t>(
                   scale, i, align_corners, /*cubic=*/true);
-          input_index = static_cast<int64_t>(floorf(real_input_index));
-          get_cubic_upsample_coefficients<scalar_t>(coeffs, real_input_index - input_index);
+          opmath_t lambda;
+          guard_index_and_lambda(real_input_index, input_size, input_index, lambda);
+          get_cubic_upsample_coefficients<opmath_t>(coeffs, lambda);
 
           for (const auto j : c10::irange(interp_size)) {
             idx_ptr = output[2 * j + 0].data_ptr<int64_t>();
@@ -1262,21 +1269,22 @@ struct HelperInterpCubic : public HelperInterpBase {
   // taken from
   // https://github.com/python-pillow/Pillow/blob/6812205f18ca4ef54372e87e1a13ce4a859434df/
   // src/libImaging/Resample.c#L46-L62
-  template<typename scalar_t>
+  template<typename scalar_t, bool use_keys_cubic=true>
   static inline scalar_t aa_filter(scalar_t x) {
     // https://en.wikipedia.org/wiki/Bicubic_interpolation#Bicubic_convolution_algorithm
-#define a -0.5
-    if (x < 0.0) {
-      x = -x;
-    }
+    // a = -0.5 was proposed by R. Keys in "Cubic convolution interpolation for digital image processing"
+    // We are using -0.5 for bicubic, antialiasing=true (compatibility with PIL)
+    // and using -0.75 for bicubic, antialiasing=false (compatibility with Opencv)
+    constexpr scalar_t a = use_keys_cubic ? -0.5 : -0.75;
+
+    x = std::abs(x);
     if (x < 1.0) {
-      return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+        return cubic_convolution1(x, a);
     }
     if (x < 2.0) {
-      return (((x - 5) * x + 8) * x - 4) * a;
+        return cubic_convolution2(x, a);
     }
     return 0.0;
-#undef a
   }
 
   static inline std::vector<Tensor> compute_indices_weights_aa(
@@ -1287,7 +1295,8 @@ struct HelperInterpCubic : public HelperInterpBase {
     int64_t ndims,
     int64_t reshape_dim,
     bool align_corners,
-    const c10::optional<double> opt_scale
+    const c10::optional<double> opt_scale,
+    bool antialias
   ) {
 
     std::vector<Tensor> indices_weights;
@@ -1300,6 +1309,7 @@ struct HelperInterpCubic : public HelperInterpBase {
         auto interp_size = HelperInterpCubic::interp_size;
         int unused;
         scalar_t unused_2;
+        auto align_corners_delta = (align_corners && !antialias) ? 0.5 : 0.0;
 
         std::tie(indices_weights, unused, unused_2) = HelperInterpCubic::_compute_indices_weights_aa<scalar_t>(
             input_size,
@@ -1310,11 +1320,32 @@ struct HelperInterpCubic : public HelperInterpBase {
             scale,
             interp_size,
             &HelperInterpCubic::aa_filter<scalar_t>,
-            /*antialias=*/true,
-            /*align_corners_delta*/0.0);
+            /*antialias=*/antialias,
+            /*align_corners_delta*/align_corners_delta);
       }
     );
     return indices_weights;
+  }
+
+  static inline std::tuple<std::vector<Tensor>, int, unsigned int> compute_indices_int16_weights_aa(
+    int64_t input_size,
+    int64_t output_size,
+    int64_t stride,
+    int64_t ndims,
+    int64_t reshape_dim,
+    bool align_corners,
+    const c10::optional<double> opt_scale,
+    bool antialias,
+    bool align_i32=false
+  ) {
+
+    auto interp_size = HelperInterpCubic::interp_size;
+    // We have to use the -0.75 constant when aa is False so that this uint8
+    // path is as close as possible to float results.
+    auto fn = antialias ? HelperInterpCubic::aa_filter<double, true> : HelperInterpCubic::aa_filter<double, false>;
+    return HelperInterpCubic::_compute_indices_int16_weights_aa(
+        input_size, output_size, stride, ndims, reshape_dim,
+        align_corners, opt_scale, interp_size, fn, antialias, align_i32);
   }
 
 };
@@ -1333,6 +1364,7 @@ void upsample_generic_Nd_kernel_impl(
     const Tensor& input,
     bool align_corners,
     const scale_type& scales) {
+
 
   // input can be NCHW, NCL or NCKHW
   auto shape = input.sizes().vec();
@@ -1388,14 +1420,14 @@ void upsample_generic_Nd_kernel_impl(
 
   if (interp_size > 1) {
     // Nearest also supports uint8 tensor, so need to handle it separately
-    AT_DISPATCH_FLOATING_TYPES_AND(
-        at::ScalarType::BFloat16, iter.dtype(), "upsample_generic_Nd", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        kBFloat16, kHalf, iter.dtype(), "upsample_generic_Nd", [&] {
         // MSVC can not catch constexpr int interp_size here
         constexpr int mode = F::interp_size;
         cpu_upsample_generic<scalar_t, out_ndims, mode>(iter);
     });
   } else {
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Byte, at::ScalarType::BFloat16,
+    AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         iter.dtype(), "upsample_generic_Nd", [&] {
         constexpr int mode = F::interp_size;
         cpu_upsample_generic<scalar_t, out_ndims, mode>(iter);
@@ -1470,21 +1502,22 @@ void _separable_upsample_generic_Nd_kernel_impl_single_dim(
   int unused;
 
   if (input_scalar_type == at::kByte) {
+    // This is a special branch to provide uint8 dtype support for bilinear and bicubic modes only
+    TORCH_INTERNAL_ASSERT(F::interp_size == 2 || F::interp_size == 4);
     std::tie(indices_weights, unused, weights_precision) =
-      // TODO: change that to F:: once / if bicubic mode supports uint8 after all
-      HelperInterpLinear::compute_indices_int16_weights_aa(
+      F::compute_indices_int16_weights_aa(
         input.size(interp_dim), oshape[interp_dim],
         input.stride(interp_dim) * input.element_size(),
         input.dim(), interp_dim, align_corners, scales[interp_dim - 2],
         antialias);
     TORCH_INTERNAL_ASSERT(weights_precision > 0);
   } else {
-    TORCH_INTERNAL_ASSERT(antialias);
     indices_weights =
       F::compute_indices_weights_aa(
         input_scalar_type, input.size(interp_dim), oshape[interp_dim],
         input.stride(interp_dim) * input.element_size(),
-        input.dim(), interp_dim, align_corners, scales[interp_dim - 2]);
+        input.dim(), interp_dim, align_corners, scales[interp_dim - 2],
+        antialias);
   }
 
   TensorIteratorConfig config;
@@ -1630,7 +1663,7 @@ void upsample_nearest2d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
   if (_use_vectorized_kernel_cond_2d(output, input)) {
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Byte, at::ScalarType::BFloat16,
+    AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_h, scales_w});
     });
@@ -1646,7 +1679,7 @@ void _upsample_nearest_exact2d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
   if (_use_vectorized_kernel_cond_2d(output, input)) {
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::Byte, input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf, input.scalar_type(), "upsample_nearest2d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_h, scales_w});
     });
   } else {
@@ -1662,7 +1695,7 @@ void upsample_nearest3d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
   if (_use_vectorized_kernel_cond_3d(output, input)) {
-    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Byte, at::ScalarType::BFloat16,
+    AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf,
         input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_idx>(output, input, {scales_d, scales_h, scales_w});
     });
@@ -1679,7 +1712,7 @@ void _upsample_nearest_exact3d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
   if (_use_vectorized_kernel_cond_3d(output, input)) {
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::Byte, input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND3(kByte, kBFloat16, kHalf, input.scalar_type(), "upsample_nearest3d_channels_last", [&] {
       cpu_upsample_nearest_channels_last<scalar_t, scale_t, nearest_exact_idx>(output, input, {scales_d, scales_h, scales_w});
     });
   } else {
@@ -1711,7 +1744,7 @@ void upsample_bilinear2d_kernel_impl_float(
   // That's not the case for masks though (C == 1), which strongly benefit from
   // using the generic kernel.
   if ((_use_vectorized_kernel_cond_2d(output, input)) || (at::get_num_threads() == 1 && input.size(1) == 3)) {
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, input.scalar_type(), "upsample_bilinear2d_channels_last", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, input.scalar_type(), "upsample_bilinear2d_channels_last", [&] {
       cpu_upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_h, scales_w});
     });
   } else {
@@ -1730,7 +1763,7 @@ void upsample_bilinear2d_kernel_impl(
   if (input.dtype() == at::kByte){
     #ifdef CPU_CAPABILITY_AVX2
       if (input.size(1) <= 4) {
-        upsample_avx_bilinear_uint8<scale_t, HelperInterpLinear>(input,
+        upsample_avx_bilinear_bicubic_uint8<scale_t, HelperInterpLinear>(input,
           output, align_corners, {scales_h, scales_w},
           /*antialias=*/false);
       } else {
@@ -1757,7 +1790,7 @@ void upsample_bilinear2d_aa_kernel_impl(
     c10::optional<double> scales_w) {
 #ifdef CPU_CAPABILITY_AVX2
   if (input.dtype() == at::kByte && input.size(1) <= 4) {
-    upsample_avx_bilinear_uint8<scale_t, HelperInterpLinear>(
+    upsample_avx_bilinear_bicubic_uint8<scale_t, HelperInterpLinear>(
       input, output, align_corners, {scales_h, scales_w},
       /*antialias=*/true);
   } else {
@@ -1780,7 +1813,7 @@ void upsample_trilinear3d_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
   if ((_use_vectorized_kernel_cond_3d(output, input))) {
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, input.scalar_type(), "upsample_trilinear3d_channels_last", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, input.scalar_type(), "upsample_trilinear3d_channels_last", [&] {
       cpu_upsample_linear_channels_last<scalar_t, scale_t>(output, input, align_corners, {scales_d, scales_h, scales_w});
     });
   } else {
@@ -1795,8 +1828,28 @@ void upsample_bicubic2d_kernel_impl(
     bool align_corners,
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
-  upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
-    output, input, align_corners, {scales_h, scales_w});
+
+  if (input.dtype() == at::kByte){
+    #ifdef CPU_CAPABILITY_AVX2
+      if (input.size(1) <= 4) {
+        upsample_avx_bilinear_bicubic_uint8<scale_t, HelperInterpCubic>(input,
+          output, align_corners, {scales_h, scales_w},
+          /*antialias=*/false);
+      } else {
+        separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+          output, input, align_corners, {scales_h, scales_w},
+          /*antialias=*/false);
+      }
+    #else  // CPU_CAPABILITY_AVX2
+      separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+        output, input, align_corners, {scales_h, scales_w},
+        /*antialias=*/false);
+    #endif  // CPU_CAPABILITY_AVX2
+  }
+  else {
+    upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+      output, input, align_corners, {scales_h, scales_w});
+  }
 }
 
 void upsample_bicubic2d_aa_kernel_impl(
@@ -1806,9 +1859,21 @@ void upsample_bicubic2d_aa_kernel_impl(
     c10::optional<double> scales_h,
     c10::optional<double> scales_w) {
 
+#ifdef CPU_CAPABILITY_AVX2
+  if (input.dtype() == at::kByte && input.size(1) <= 4) {
+    upsample_avx_bilinear_bicubic_uint8<scale_t, HelperInterpCubic>(
+      input, output, align_corners, {scales_h, scales_w},
+      /*antialias=*/true);
+  } else {
+    separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
+        output, input, align_corners, {scales_h, scales_w},
+        /*antialias=*/true);
+  }
+#else // CPU_CAPABILITY_AVX2
   separable_upsample_generic_Nd_kernel_impl<2, scale_t, HelperInterpCubic>(
-    output, input, align_corners, {scales_h, scales_w},
-    /*antialias=*/true);
+      output, input, align_corners, {scales_h, scales_w},
+      /*antialias=*/true);
+#endif // CPU_CAPABILITY_AVX2
 }
 
 template <
@@ -1827,7 +1892,7 @@ void cpu_upsample_genNd_backward_aa(
   auto grad_input = grad_input_.contiguous();
 
   auto grad_output_data = grad_output.data_ptr<scalar_t>();
-  auto grad_input_data = grad_input.data_ptr<scalar_t>();
+  auto grad_input_data = grad_input.mutable_data_ptr<scalar_t>();
   auto input_sizes = grad_input.sizes().vec();
   auto output_sizes = grad_output.sizes().vec();
   auto ndim = input_sizes.size();

@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+
 # If you need to modify this file to make this test pass, please also apply same edits accordingly to
 # https://github.com/pytorch/examples/blob/master/distributed/rpc/rl/main.py
 # and https://pytorch.org/tutorials/intermediate/rpc_tutorial.html
@@ -225,7 +227,7 @@ def run_agent(agent, n_steps):
         last_reward = agent.finish_episode()
 
         if agent.running_reward > agent.reward_threshold:
-            print("Solved! Running reward is now {}!".format(agent.running_reward))
+            print(f"Solved! Running reward is now {agent.running_reward}!")
             break
 
 
